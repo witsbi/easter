@@ -139,6 +139,47 @@ class Kernel:
     def get_genesis_state(self) -> dict[str, Any] | None:
         return self.get_state("state:genesis")
 
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    receipt_id,
+                    operation_id,
+                    transition_id,
+                    outcome,
+                    created_at,
+                    payload
+                FROM receipts
+                WHERE receipt_id = ?
+                """,
+                (receipt_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "receipt_id": row["receipt_id"],
+            "operation_id": row["operation_id"],
+            "transition_id": row["transition_id"],
+            "outcome": row["outcome"],
+            "created_at": row["created_at"],
+            "payload": json.loads(row["payload"]),
+        }
+
+    def count_states(self) -> int:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM states"
+            ).fetchone()["n"]
+
+    def count_transitions(self) -> int:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) AS n FROM transitions"
+            ).fetchone()["n"]
+
     def get_grant(self, grant_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -176,20 +217,55 @@ class Kernel:
     # AUTHORITY
     # ---------------------------------------------------------
 
+    def is_grant_superseded(self, grant_id: str) -> bool:
+        """
+        Whether any committed transition has declared this grant
+        superseded.
+
+        This uses no schema beyond the existing transitions table.
+        transitions.payload is already opaque, kernel-agnostic JSON
+        (design principle 5: "userland meaning lives in JSON
+        payloads, not schema"). A committed transition may carry a
+        reserved "supersedes_grant_ids" key in that payload; this is
+        a Python-side *semantic* law (design principle 4), not a
+        structural one, so it is evaluated here rather than in
+        SQLite. Only rows in the transitions table are considered --
+        rejected/failed attempts never reach it, so an attempted-but-
+        rejected supersession cannot count.
+        """
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM transitions"
+            ).fetchall()
+
+        for row in rows:
+            payload = json.loads(row["payload"])
+            superseded_ids = payload.get("supersedes_grant_ids") or []
+
+            if grant_id in superseded_ids:
+                return True
+
+        return False
+
     def validate_grant(
         self,
         grant_id: str,
         at_time: str | None = None,
+        requester_identity_id: str | None = None,
     ) -> dict[str, Any]:
         """
-        Validate that a grant exists and is temporally valid.
+        Validate that a grant exists, is temporally valid, has not
+        been superseded, and (when a requester is given) is actually
+        held by the identity attempting to exercise it.
 
         v0.1 currently validates:
             - grant exists
             - valid_from has been reached
             - expires_at has not been reached
-
-        Revocation is intentionally not implemented yet.
+            - grant has not been superseded (see is_grant_superseded)
+            - the requesting identity is the identity the grant was
+              issued to, when a requester is supplied
         """
 
         grant = self.get_grant(grant_id)
@@ -197,6 +273,15 @@ class Kernel:
         if grant is None:
             raise AuthorityError(
                 f"authority grant does not exist: {grant_id}"
+            )
+
+        if (
+            requester_identity_id is not None
+            and grant["identity_id"] != requester_identity_id
+        ):
+            raise AuthorityError(
+                f"identity {requester_identity_id} does not hold "
+                f"grant: {grant_id}"
             )
 
         now = parse_timestamp(at_time or utc_now())
@@ -216,6 +301,11 @@ class Kernel:
                 raise AuthorityError(
                     f"authority grant has expired: {grant_id}"
                 )
+
+        if self.is_grant_superseded(grant_id):
+            raise AuthorityError(
+                f"authority grant has been superseded: {grant_id}"
+            )
 
         return grant
 
@@ -307,6 +397,7 @@ class Kernel:
     def transition(
         self,
         *,
+        requester_identity_id: str,
         from_state_id: str,
         authority_grant_id: str,
         new_state_payload: dict[str, Any],
@@ -314,9 +405,22 @@ class Kernel:
         evidence_ids: list[str] | None = None,
         invariant_ids: list[str] | None = None,
         new_identities: list[dict[str, Any]] | None = None,
+        new_authorities: list[dict[str, Any]] | None = None,
+        new_grants: list[dict[str, Any]] | None = None,
+        supersedes_grant_ids: list[str] | None = None,
     ) -> dict[str, str]:
         """
         Commit an authoritative state transition.
+
+        requester_identity_id is the identity actually attempting the
+        operation. The kernel verifies that this identity is the one
+        the presented authority_grant_id was issued to -- possession
+        of a grant_id alone is not sufficient to exercise it.
+
+        supersedes_grant_ids records, inside this transition's own
+        payload (no schema change), that the listed grants are no
+        longer effective as of this transition. See
+        is_grant_superseded for how this is read back.
 
         On success, state + transition + associations + receipt
         are committed atomically.
@@ -328,6 +432,11 @@ class Kernel:
         operation_id = new_id("operation")
 
         try:
+            if not requester_identity_id:
+                raise AuthorityError(
+                    "requester_identity_id is required"
+                )
+
             # -------------------------------------------------
             # Validate source state.
             # -------------------------------------------------
@@ -340,10 +449,15 @@ class Kernel:
                 )
 
             # -------------------------------------------------
-            # Validate authority.
+            # Validate authority: grant exists, is temporally
+            # valid, has not been superseded, and is actually
+            # held by the requesting identity.
             # -------------------------------------------------
 
-            grant = self.validate_grant(authority_grant_id)
+            grant = self.validate_grant(
+                authority_grant_id,
+                requester_identity_id=requester_identity_id,
+            )
 
             # -------------------------------------------------
             # Future invariant evaluation belongs here.
@@ -355,12 +469,57 @@ class Kernel:
             evidence_ids = evidence_ids or []
             invariant_ids = invariant_ids or []
             new_identities = new_identities or []
+            new_authorities = new_authorities or []
+            new_grants = new_grants or []
+            supersedes_grant_ids = supersedes_grant_ids or []
 
             for identity in new_identities:
                 identity_id = identity.get("identity_id")
                 if not isinstance(identity_id, str) or not identity_id:
                     raise StateError(
                         "new identity requires a non-empty identity_id"
+                    )
+
+            for authority in new_authorities:
+                authority_id = authority.get("authority_id")
+                if not isinstance(authority_id, str) or not authority_id:
+                    raise StateError(
+                        "new authority requires a non-empty authority_id"
+                    )
+
+            for new_grant in new_grants:
+                grant_id = new_grant.get("grant_id")
+                grant_identity_id = new_grant.get("identity_id")
+                grant_authority_id = new_grant.get("authority_id")
+                grant_valid_from = new_grant.get("valid_from")
+
+                if not isinstance(grant_id, str) or not grant_id:
+                    raise StateError(
+                        "new grant requires a non-empty grant_id"
+                    )
+                if (
+                    not isinstance(grant_identity_id, str)
+                    or not grant_identity_id
+                ):
+                    raise StateError(
+                        f"new grant {grant_id} requires a non-empty "
+                        f"identity_id"
+                    )
+                if (
+                    not isinstance(grant_authority_id, str)
+                    or not grant_authority_id
+                ):
+                    raise StateError(
+                        f"new grant {grant_id} requires a non-empty "
+                        f"authority_id"
+                    )
+                if (
+                    not isinstance(grant_valid_from, str)
+                    or not grant_valid_from
+                ):
+                    raise StateError(
+                        f"new grant {grant_id} requires a non-empty "
+                        f"valid_from"
                     )
 
             # -------------------------------------------------
@@ -419,6 +578,64 @@ class Kernel:
                         ),
                     )
 
+                # New authority definitions created by this
+                # transition. Existing `authorities` table, no
+                # schema change.
+
+                for authority in new_authorities:
+                    conn.execute(
+                        """
+                        INSERT INTO authorities (
+                            authority_id,
+                            created_at,
+                            payload
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            authority["authority_id"],
+                            created_at,
+                            encode_payload(authority.get("payload")),
+                        ),
+                    )
+
+                # New authority grants created by this transition.
+                # Existing `authority_grants` table, no schema
+                # change.
+                #
+                # granted_by_identity_id is always the requester --
+                # never caller-supplied -- so a grant's recorded
+                # provenance cannot be spoofed to claim a different
+                # granting identity than the one the kernel actually
+                # verified.
+
+                for new_grant in new_grants:
+                    conn.execute(
+                        """
+                        INSERT INTO authority_grants (
+                            grant_id,
+                            identity_id,
+                            authority_id,
+                            granted_by_identity_id,
+                            created_at,
+                            valid_from,
+                            expires_at,
+                            payload
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_grant["grant_id"],
+                            new_grant["identity_id"],
+                            new_grant["authority_id"],
+                            requester_identity_id,
+                            created_at,
+                            new_grant["valid_from"],
+                            new_grant.get("expires_at"),
+                            encode_payload(new_grant.get("payload")),
+                        ),
+                    )
+
                 # New immutable state.
 
                 conn.execute(
@@ -461,6 +678,16 @@ class Kernel:
                             {
                                 **(transition_payload or {}),
                                 "identity_id": grant["identity_id"],
+                                "requester_identity_id":
+                                    requester_identity_id,
+                                **(
+                                    {
+                                        "supersedes_grant_ids":
+                                            list(supersedes_grant_ids),
+                                    }
+                                    if supersedes_grant_ids
+                                    else {}
+                                ),
                             }
                         ),
                     ),

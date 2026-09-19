@@ -4,6 +4,7 @@ kernel = Kernel()
 
 try:
     kernel.transition(
+        requester_identity_id="identity:nathan",
         from_state_id="state:genesis",
         authority_grant_id="grant:does-not-exist",
         new_state_payload={
