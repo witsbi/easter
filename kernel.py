@@ -313,6 +313,7 @@ class Kernel:
         transition_payload: dict[str, Any] | None = None,
         evidence_ids: list[str] | None = None,
         invariant_ids: list[str] | None = None,
+        new_identities: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """
         Commit an authoritative state transition.
@@ -353,6 +354,14 @@ class Kernel:
 
             evidence_ids = evidence_ids or []
             invariant_ids = invariant_ids or []
+            new_identities = new_identities or []
+
+            for identity in new_identities:
+                identity_id = identity.get("identity_id")
+                if not isinstance(identity_id, str) or not identity_id:
+                    raise StateError(
+                        "new identity requires a non-empty identity_id"
+                    )
 
             # -------------------------------------------------
             # Generate immutable IDs before transaction.
@@ -385,6 +394,29 @@ class Kernel:
                 if source_exists is None:
                     raise StateError(
                         f"source state disappeared: {from_state_id}"
+                    )
+
+                # New identities created by this transition.
+                #
+                # Identity creation is part of the same authoritative
+                # transaction as the state transition. Merely appearing
+                # in a state payload does not create kernel identity.
+
+                for identity in new_identities:
+                    conn.execute(
+                        """
+                        INSERT INTO identities (
+                            identity_id,
+                            created_at,
+                            payload
+                        )
+                        VALUES (?, ?, ?)
+                        """,
+                        (
+                            identity["identity_id"],
+                            created_at,
+                            encode_payload(identity.get("payload")),
+                        ),
                     )
 
                 # New immutable state.
