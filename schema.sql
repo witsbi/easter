@@ -104,14 +104,8 @@ CREATE TABLE authority_grants (
 
 CREATE TABLE states (
     state_id         TEXT PRIMARY KEY,
-    parent_state_id  TEXT,
     created_at       TEXT NOT NULL,
-    payload          TEXT NOT NULL,
-
-    FOREIGN KEY (parent_state_id)
-        REFERENCES states(state_id),
-
-    CHECK (state_id <> parent_state_id)
+    payload          TEXT NOT NULL
 );
 
 
@@ -299,9 +293,6 @@ CREATE INDEX idx_authority_grants_identity
 
 CREATE INDEX idx_authority_grants_authority
     ON authority_grants(authority_id);
-
-CREATE INDEX idx_states_parent
-    ON states(parent_state_id);
 
 CREATE INDEX idx_transitions_from_state
     ON transitions(from_state_id);

@@ -113,13 +113,11 @@ VALUES (
 
 INSERT INTO states (
     state_id,
-    parent_state_id,
     created_at,
     payload
 )
 VALUES (
     'state:genesis',
-    NULL,
     '2026-09-19T00:00:00Z',
     json_object(
         'genesis', 1,

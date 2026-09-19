@@ -65,6 +65,7 @@ def encode_payload(payload: dict[str, Any] | None) -> str:
         payload or {},
         separators=(",", ":"),
         sort_keys=True,
+        allow_nan=False,
     )
 
 
@@ -87,6 +88,8 @@ class Kernel:
 
         # Foreign-key enforcement is connection-specific in SQLite.
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA recursive_triggers = ON")
+
 
         return conn
 
@@ -116,7 +119,6 @@ class Kernel:
                 """
                 SELECT
                     state_id,
-                    parent_state_id,
                     created_at,
                     payload
                 FROM states
@@ -130,7 +132,6 @@ class Kernel:
 
         return {
             "state_id": row["state_id"],
-            "parent_state_id": row["parent_state_id"],
             "created_at": row["created_at"],
             "payload": json.loads(row["payload"]),
         }
@@ -392,15 +393,13 @@ class Kernel:
                     """
                     INSERT INTO states (
                         state_id,
-                        parent_state_id,
                         created_at,
                         payload
                     )
-                    VALUES (?, ?, ?, ?)
+                    VALUES ( ?, ?, ?)
                     """,
                     (
                         state_id,
-                        from_state_id,
                         created_at,
                         encode_payload(new_state_payload),
                     ),
@@ -531,6 +530,21 @@ class Kernel:
                 f"[receipt={receipt_id}]"
             ) from exc
 
+        except  Exception as exc:
+            receipt_id = self.record_failure(
+                operation_id=operation_id,
+                outcome="FAILED",
+                reason="unexpected kernel operation failure",
+                details={
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+
+            raise KernelError(
+                f"unexpected kernel operation failure "
+                f"[receipt={receipt_id}]"
+            ) from exc 
 
 # -------------------------------------------------------------
 # Minimal command-line smoke test
