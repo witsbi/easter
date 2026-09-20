@@ -633,6 +633,28 @@ class Kernel:
         actually exist get linked; anything that doesn't is recorded
         in the exception payload instead of silently dropped or
         allowed to crash the receipt path.
+
+        The caller-supplied `details` dict is Exception-owned diagnostic
+        content and is never validated/sanitized by any caller -- it may
+        be unencodable (NaN/Infinity, rejected by encode_payload's
+        allow_nan=False) or exceed SQLite's json_valid() nesting depth
+        limit (currently 1000; see exceptions.payload's
+        CHECK(json_valid(...))). Either failure happens INSIDE this
+        method's own write transaction, after the Receipt row has
+        already been inserted (see the Exception red-team's EXC-7:
+        forcing a failure at that exact point confirmed the whole
+        transaction rolls back atomically, leaving no receipt at all)
+        -- which would otherwise make the "UNCONDITIONALLY able to
+        produce a receipt" guarantee above false. So this method
+        degrades instead: if `details` cannot be represented, the
+        Exception's `details` are replaced with a small, minimal,
+        kernel-authored fallback (never a retry of the original
+        content in any form) and the FAILED/REJECTED Receipt +
+        Exception are still persisted atomically. If even that
+        fallback insert fails, the transaction rolls back with no
+        receipt at all, exactly as EXC-7 already established for a
+        genuine persistence failure -- this method still does not
+        pretend to have committed something it did not.
         """
 
         if outcome not in {"REJECTED", "FAILED"}:
@@ -699,23 +721,76 @@ class Kernel:
                 ),
             )
 
-            conn.execute(
-                """
-                INSERT INTO exceptions (
-                    exception_id,
-                    receipt_id,
-                    created_at,
-                    payload
+            def insert_exception(payload: dict[str, Any]) -> None:
+                conn.execute(
+                    """
+                    INSERT INTO exceptions (
+                        exception_id,
+                        receipt_id,
+                        created_at,
+                        payload
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        exception_id,
+                        receipt_id,
+                        created_at,
+                        encode_payload(payload),
+                    ),
                 )
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    exception_id,
-                    receipt_id,
-                    created_at,
-                    encode_payload(exception_payload),
-                ),
-            )
+
+            try:
+                insert_exception(exception_payload)
+            except (
+                ValueError,
+                TypeError,
+                RecursionError,
+                sqlite3.IntegrityError,
+            ) as encode_exc:
+                # ValueError/TypeError/RecursionError: encode_payload
+                # itself failed on `details` before any SQL ran (e.g.
+                # NaN/Infinity, or a future serializer failure of
+                # comparable type). sqlite3.IntegrityError: encode_payload
+                # succeeded but SQLite's json_valid() CHECK rejected the
+                # result (currently: nesting depth > 1000) -- catching
+                # this one is deliberately narrowed to json_valid
+                # specifically, so an unrelated IntegrityError (e.g. a
+                # real bug tripping the receipt_id UNIQUE/FK constraints)
+                # still surfaces instead of being silently reinterpreted
+                # as an encoding problem.
+                if (
+                    isinstance(encode_exc, sqlite3.IntegrityError)
+                    and "json_valid" not in str(encode_exc)
+                ):
+                    raise
+
+                fallback_payload = {
+                    "reason": reason,
+                    "details": {
+                        "kernel_fallback": True,
+                        "reason": (
+                            "original diagnostic details could not be "
+                            "represented in the kernel's accepted "
+                            "JSON/SQLite encoding"
+                        ),
+                        "encode_error_type": type(encode_exc).__name__,
+                    },
+                }
+
+                if unlinkable_evidence_ids:
+                    fallback_payload["unlinkable_evidence_ids"] = (
+                        unlinkable_evidence_ids
+                    )
+
+                # No try/except here: if even this minimal, kernel-
+                # authored fallback cannot be persisted, that is a
+                # genuine persistence failure, not an encoding problem
+                # with caller data -- it propagates out of
+                # record_failure() entirely and self.transaction()
+                # rolls back the whole attempt (Receipt included),
+                # exactly as EXC-7 established for that case.
+                insert_exception(fallback_payload)
 
             # Evidence submitted alongside a failed/rejected attempt is
             # linked to this failure receipt in this SAME transaction --
