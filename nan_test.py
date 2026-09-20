@@ -1,3 +1,10 @@
+# RETIRED / HISTORICAL -- do not run.
+#
+# Predates requester_identity_id becoming a required keyword-only
+# argument on Kernel.transition(). Will raise TypeError if run.
+# NaN/Infinity rejection is now covered, against the current API,
+# by state_1_invariants.py (State red-team regression suite).
+
 from kernel import Kernel, KernelError
 
 kernel = Kernel()
