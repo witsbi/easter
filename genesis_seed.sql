@@ -84,6 +84,7 @@ VALUES (
 
 INSERT INTO authority_grants (
     grant_id,
+    authority_seq,
     identity_id,
     authority_id,
     granted_by_identity_id,
@@ -94,6 +95,7 @@ INSERT INTO authority_grants (
 )
 VALUES (
     'grant:genesis-root',
+    1,
     'identity:nathan',
     'authority:root',
     NULL,

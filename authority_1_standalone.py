@@ -5,8 +5,9 @@ Exercises the redesigned Authority model that replaces AUTHORITY-0B..
 0F (authority_0b_0f.py, now retired -- see its header). Authority
 lifecycle (grant/revoke/revoke_all) is now independent of State:
 none of `Kernel.grant`, `Kernel.revoke`, `Kernel.revoke_all` create
-or require a State transition, and revocation is read back from
-`receipts` (via `Kernel.is_grant_revoked`) rather than from
+or require a State transition, and revocation is read back from the
+append-only Authority revocation ledger (via
+`Kernel.is_grant_revoked`) rather than from Receipt or
 `transitions.payload`.
 
 Schema change made to support this (see
