@@ -52,12 +52,12 @@ with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as
             from_state_id=GENESIS,
             authority_grant_id=ROOT,
             new_state_payload={"probe": "exc-1-seed"},
-            invariant_ids=["invariant:does-not-exist-exc-1"],
+            evidence_ids=["evidence:does-not-exist-exc-1"],
         )
     except KernelError:
         pass
     else:
-        raise AssertionError("dangling invariant_id must reject transition()")
+        raise AssertionError("dangling evidence_id must reject transition()")
 
     with kernel.connect() as conn:
         exc_row = conn.execute(
@@ -132,7 +132,7 @@ with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as
         assert exc_row is not None, f"{label}: Receipt/Exception must stay linked"
         return outcome
 
-    # (a) transition(): genuine sqlite3.IntegrityError (dangling invariant)
+    # (a) transition(): genuine sqlite3.IntegrityError (dangling evidence_id)
     assert_atomic_failure(
         "transition/IntegrityError",
         lambda: kernel.transition(
@@ -140,7 +140,7 @@ with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as
             from_state_id=GENESIS,
             authority_grant_id=ROOT,
             new_state_payload={"probe": "exc-2a"},
-            invariant_ids=["invariant:does-not-exist-exc-2a"],
+            evidence_ids=["evidence:does-not-exist-exc-2a"],
         ),
     )
 

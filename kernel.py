@@ -8,8 +8,7 @@ Responsibilities:
     - Own all writes to authoritative SQLite state.
     - Validate authority before committing transitions.
     - Preserve append-only semantics.
-    - Commit state + transition + evidence links + invariant links
-      + receipt atomically.
+    - Commit state + transition + evidence links + receipt atomically.
     - Produce failure receipts/exceptions without changing state.
 
 SQLite remains responsible for:
@@ -46,10 +45,6 @@ class AuthorityError(KernelError):
 
 class StateError(KernelError):
     """Raised when state validation fails."""
-
-
-class InvariantError(KernelError):
-    """Raised when an invariant fails."""
 
 
 def utc_now() -> str:
@@ -1898,7 +1893,6 @@ class Kernel:
         new_state_payload: dict[str, Any],
         transition_payload: dict[str, Any] | None = None,
         evidence_ids: list[str] | None = None,
-        invariant_ids: list[str] | None = None,
         new_identities: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """
@@ -1964,15 +1958,7 @@ class Kernel:
                     f"source state does not exist: {from_state_id}"
                 )
 
-            # -------------------------------------------------
-            # Future invariant evaluation belongs here.
-            #
-            # For v0.1, invariant IDs are provenance references.
-            # We are NOT pretending they have been evaluated yet.
-            # -------------------------------------------------
-
             evidence_ids = evidence_ids or []
-            invariant_ids = invariant_ids or []
             new_identities = new_identities or []
 
             for identity in new_identities:
@@ -2102,23 +2088,6 @@ class Kernel:
                         ),
                     ),
                 )
-
-                # Invariant references.
-
-                for invariant_id in invariant_ids:
-                    conn.execute(
-                        """
-                        INSERT INTO transition_invariants (
-                            transition_id,
-                            invariant_id
-                        )
-                        VALUES (?, ?)
-                        """,
-                        (
-                            transition_id,
-                            invariant_id,
-                        ),
-                    )
 
                 # Success receipt. Must be inserted BEFORE the evidence
                 # links below -- receipt_evidence.receipt_id is a

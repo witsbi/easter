@@ -206,23 +206,6 @@ CREATE TABLE states (
 
 
 -- ============================================================
--- INVARIANTS
--- ============================================================
---
--- Immutable definitions/references for kernel-recognized
--- invariants.
---
--- SQLite stores them. Python evaluates them.
--- ============================================================
-
-CREATE TABLE invariants (
-    invariant_id     TEXT PRIMARY KEY,
-    created_at       TEXT NOT NULL,
-    payload          TEXT NOT NULL
-);
-
-
--- ============================================================
 -- EVIDENCE
 -- ============================================================
 --
@@ -271,28 +254,6 @@ CREATE TABLE transitions (
     CHECK (from_state_id <> to_state_id),
 
     UNIQUE (to_state_id)
-);
-
-
--- ============================================================
--- TRANSITION INVARIANTS
--- ============================================================
---
--- Records which invariants participated in validating a committed
--- transition.
--- ============================================================
-
-CREATE TABLE transition_invariants (
-    transition_id   TEXT NOT NULL,
-    invariant_id    TEXT NOT NULL,
-
-    PRIMARY KEY (transition_id, invariant_id),
-
-    FOREIGN KEY (transition_id)
-        REFERENCES transitions(transition_id),
-
-    FOREIGN KEY (invariant_id)
-        REFERENCES invariants(invariant_id)
 );
 
 
@@ -546,23 +507,6 @@ BEGIN
 END;
 
 
--- invariants
-
-CREATE TRIGGER invariants_no_update
-BEFORE UPDATE ON invariants
-BEGIN
-    SELECT RAISE(ABORT,
-        'kernel violation: invariants are immutable');
-END;
-
-CREATE TRIGGER invariants_no_delete
-BEFORE DELETE ON invariants
-BEGIN
-    SELECT RAISE(ABORT,
-        'kernel violation: invariants are append-only');
-END;
-
-
 -- evidence
 
 CREATE TRIGGER evidence_no_update
@@ -594,23 +538,6 @@ BEFORE DELETE ON transitions
 BEGIN
     SELECT RAISE(ABORT,
         'kernel violation: transitions are append-only');
-END;
-
-
--- transition_invariants
-
-CREATE TRIGGER transition_invariants_no_update
-BEFORE UPDATE ON transition_invariants
-BEGIN
-    SELECT RAISE(ABORT,
-        'kernel violation: transition invariant records are immutable');
-END;
-
-CREATE TRIGGER transition_invariants_no_delete
-BEFORE DELETE ON transition_invariants
-BEGIN
-    SELECT RAISE(ABORT,
-        'kernel violation: transition invariant records are append-only');
 END;
 
 
