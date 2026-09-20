@@ -55,11 +55,13 @@ VALUES (
 INSERT INTO authorities (
     authority_id,
     created_at,
+    is_root,
     payload
 )
 VALUES (
     'authority:root',
     '2026-09-19T00:00:00Z',
+    1,
     json_object(
         'name', 'root',
         'description', 'Genesis root authority'

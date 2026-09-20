@@ -1,27 +1,29 @@
 """
-AUTHORITY-0B through 0F.
+AUTHORITY-0B through 0F. RETIRED / HISTORICAL -- do not run.
 
 Continues the authority lifecycle experiment from AUTHORITY-0A
 (authority_0a.py), which established identity:clawde through a
 Nathan/root-authorized state transition. Clawde had identity but no
 authority at the end of 0A.
 
-This script exercises: grant, exercise, exceed, revoke/supersede, and
-post-revocation retry -- the smallest end-to-end lifecycle needed to
-put the frozen AUTHORITY primitive under real use.
+This script exercised: grant, exercise, exceed, revoke/supersede, and
+post-revocation retry via `transition(supersedes_grant_ids=...)` and
+`Kernel.is_grant_superseded`.
 
-Hard constraints for this run:
-  - schema.sql and genesis_seed.sql are frozen. Nothing here adds a
-    table, column, index, or trigger. Revocation is represented
-    entirely inside the existing transitions.payload column (already
-    opaque, kernel-agnostic JSON -- see is_grant_superseded in
-    kernel.py) and read back in Python, matching schema.sql's own
-    stated design split: SQLite enforces structural law, Python
-    enforces semantic law.
-  - All authoritative reads/writes below go through the Kernel
-    boundary only (Kernel.transition / Kernel.get_* / Kernel.count_*
-    / Kernel.is_grant_superseded). No direct SQLite access anywhere
-    in this file.
+That mechanism coupled Authority revocation to State transitions --
+revoking a grant required fabricating an unrelated state change just
+to carry the fact. It has been removed. Revocation is now a
+standalone kernel Authority operation (`Kernel.revoke`/`revoke_all`,
+read back via `Kernel.is_grant_revoked`) that requires no State
+transition at all. See authority_1_standalone.py for the superseding
+experiment (AUTHORITY-1A..1L) that exercises the new model.
+
+This script is kept only as a provenance record of what v0.1's first
+revocation attempt looked like -- it will now raise a TypeError if
+run, since `transition()` no longer accepts `supersedes_grant_ids`
+and `Kernel.is_grant_superseded` no longer exists. Do not "fix" it to
+run again; the point of AUTHORITY-1 is that this approach was
+deliberately replaced, not merely renamed.
 """
 
 from kernel import Kernel, KernelError, utc_now
