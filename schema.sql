@@ -226,20 +226,38 @@ CREATE TABLE transition_invariants (
 
 
 -- ============================================================
--- TRANSITION EVIDENCE
+-- RECEIPT EVIDENCE
 -- ============================================================
 --
--- Records evidence associated with a committed transition.
+-- Records Evidence CITED IN SUPPORT OF a Receipt -- any Receipt:
+-- a successful Transition, a successful Authority operation (grant/
+-- revoke/revoke_all/define_authority), or a REJECTED/FAILED receipt
+-- from any of those. Keyed by receipt_id rather than transition_id
+-- specifically because Receipts, not Transitions, already represent
+-- every kernel operation outcome uniformly (see receipts' own
+-- decoupling from transition_id, migrate_receipts_decouple_from_
+-- transition.sql) -- Evidence association follows the same split.
+--
+-- This is many-to-many by design: the same immutable Evidence object
+-- may legitimately support multiple Receipts without duplicating the
+-- Evidence row itself.
+--
+-- This table records ASSOCIATION only -- Evidence cited in support of
+-- some operation's Receipt. It is never used to record an Evidence
+-- object's own creation Receipt (see record_evidence() in kernel.py):
+-- that relationship is the reverse (the Receipt produced the
+-- Evidence, the Evidence does not support the Receipt) and lives
+-- entirely in that Receipt's own kernel-authored payload instead.
 -- ============================================================
 
-CREATE TABLE transition_evidence (
-    transition_id   TEXT NOT NULL,
+CREATE TABLE receipt_evidence (
+    receipt_id      TEXT NOT NULL,
     evidence_id     TEXT NOT NULL,
 
-    PRIMARY KEY (transition_id, evidence_id),
+    PRIMARY KEY (receipt_id, evidence_id),
 
-    FOREIGN KEY (transition_id)
-        REFERENCES transitions(transition_id),
+    FOREIGN KEY (receipt_id)
+        REFERENCES receipts(receipt_id),
 
     FOREIGN KEY (evidence_id)
         REFERENCES evidence(evidence_id)
@@ -482,20 +500,20 @@ BEGIN
 END;
 
 
--- transition_evidence
+-- receipt_evidence
 
-CREATE TRIGGER transition_evidence_no_update
-BEFORE UPDATE ON transition_evidence
+CREATE TRIGGER receipt_evidence_no_update
+BEFORE UPDATE ON receipt_evidence
 BEGIN
     SELECT RAISE(ABORT,
-        'kernel violation: transition evidence records are immutable');
+        'kernel violation: receipt evidence records are immutable');
 END;
 
-CREATE TRIGGER transition_evidence_no_delete
-BEFORE DELETE ON transition_evidence
+CREATE TRIGGER receipt_evidence_no_delete
+BEFORE DELETE ON receipt_evidence
 BEGIN
     SELECT RAISE(ABORT,
-        'kernel violation: transition evidence records are append-only');
+        'kernel violation: receipt evidence records are append-only');
 END;
 
 

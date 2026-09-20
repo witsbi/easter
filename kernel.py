@@ -554,11 +554,31 @@ class Kernel:
         outcome: str,
         reason: str,
         details: dict[str, Any] | None = None,
+        evidence_ids: list[str] | None = None,
     ) -> str:
         """
         Record a failed/rejected kernel operation.
 
         This creates no state and no authoritative transition.
+
+        evidence_ids lets a caller preserve Evidence it submitted
+        alongside the now-failed attempt (see transition()/grant()/
+        revoke()/revoke_all()/define_authority()) by linking it to
+        this failure receipt instead. record_failure() must be
+        UNCONDITIONALLY able to produce a receipt -- that is the one
+        thing every caller relies on no matter what went wrong. If the
+        failure itself was caused by a bad evidence_id (e.g. a
+        dangling reference), blindly attempting to link that same
+        evidence_id here would throw again with no handler above it,
+        leaving the operation with NO receipt at all -- a violation of
+        design principle 7 ("failed operations leave immutable
+        receipts/exceptions"). So this is resolved BEFORE either
+        insert below: exceptions is itself append-only/immutable (see
+        exceptions_no_update), so the unlinkable list must go into the
+        ORIGINAL insert, never a later UPDATE. Only evidence_ids that
+        actually exist get linked; anything that doesn't is recorded
+        in the exception payload instead of silently dropped or
+        allowed to crash the receipt path.
         """
 
         if outcome not in {"REJECTED", "FAILED"}:
@@ -578,6 +598,35 @@ class Kernel:
             receipt_payload["details"] = details
 
         with self.transaction() as conn:
+            requested_evidence_ids = evidence_ids or []
+            existing_evidence_ids = set()
+
+            if requested_evidence_ids:
+                placeholders = ",".join("?" for _ in requested_evidence_ids)
+                existing_evidence_ids = {
+                    row["evidence_id"]
+                    for row in conn.execute(
+                        f"SELECT evidence_id FROM evidence "
+                        f"WHERE evidence_id IN ({placeholders})",
+                        tuple(requested_evidence_ids),
+                    ).fetchall()
+                }
+
+            unlinkable_evidence_ids = [
+                eid for eid in requested_evidence_ids
+                if eid not in existing_evidence_ids
+            ]
+
+            exception_payload = {
+                "reason": reason,
+                "details": details or {},
+            }
+
+            if unlinkable_evidence_ids:
+                exception_payload["unlinkable_evidence_ids"] = (
+                    unlinkable_evidence_ids
+                )
+
             conn.execute(
                 """
                 INSERT INTO receipts (
@@ -613,14 +662,31 @@ class Kernel:
                     exception_id,
                     receipt_id,
                     created_at,
-                    encode_payload(
-                        {
-                            "reason": reason,
-                            "details": details or {},
-                        }
-                    ),
+                    encode_payload(exception_payload),
                 ),
             )
+
+            # Evidence submitted alongside a failed/rejected attempt is
+            # linked to this failure receipt in this SAME transaction --
+            # never the rolled-back attempt's own transaction -- so
+            # preserving it can never resurrect any authoritative
+            # State/Transition/Authority write.
+            for evidence_id in requested_evidence_ids:
+                if evidence_id not in existing_evidence_ids:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO receipt_evidence (
+                        receipt_id,
+                        evidence_id
+                    )
+                    VALUES (?, ?)
+                    """,
+                    (
+                        receipt_id,
+                        evidence_id,
+                    ),
+                )
 
         return receipt_id
 
@@ -649,6 +715,7 @@ class Kernel:
         valid_from: str | None = None,
         expires_at: str | None = None,
         payload: dict[str, Any] | None = None,
+        evidence_ids: list[str] | None = None,
     ) -> dict[str, str]:
         """
         Grant an existing authority to an existing identity.
@@ -664,6 +731,16 @@ class Kernel:
         does not create either one -- identity creation stays in
         transition()'s new_identities; authority definition is its
         own root-only Authority operation, see define_authority.
+
+        evidence_ids optionally cites already-admitted Evidence (see
+        record_evidence()) in support of this operation's Receipt.
+        Purely optional and inert -- it can never affect whether the
+        grant is accepted, only which Evidence ends up linked to the
+        resulting Receipt. A dangling evidence_id rolls back the whole
+        attempt, same as everything else in this atomic transaction
+        (see transition() for why); on failure, valid evidence_ids are
+        still preserved against the failure Receipt via
+        record_failure().
         """
 
         operation_id = new_id("operation")
@@ -768,6 +845,21 @@ class Kernel:
                     ),
                 )
 
+                for evidence_id in evidence_ids or []:
+                    conn.execute(
+                        """
+                        INSERT INTO receipt_evidence (
+                            receipt_id,
+                            evidence_id
+                        )
+                        VALUES (?, ?)
+                        """,
+                        (
+                            receipt_id,
+                            evidence_id,
+                        ),
+                    )
+
             return {
                 "operation_id": operation_id,
                 "grant_id": new_grant_id,
@@ -779,6 +871,7 @@ class Kernel:
                 operation_id=operation_id,
                 outcome="REJECTED",
                 reason=str(exc),
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -793,6 +886,7 @@ class Kernel:
                 details={
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -809,6 +903,7 @@ class Kernel:
                     "exception_type": type(exc).__name__,
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -823,6 +918,7 @@ class Kernel:
         authority_grant_id: str,
         grant_id: str,
         reason: str | None = None,
+        evidence_ids: list[str] | None = None,
     ) -> dict[str, str]:
         """
         Revoke a specific authority grant.
@@ -846,6 +942,11 @@ class Kernel:
         this is read back. This is permanent and unconditional: once
         revoked, grant_id can never again authorize an operation,
         regardless of which State or branch the attempt is made from.
+
+        evidence_ids optionally cites already-admitted Evidence (see
+        record_evidence()) in support of this operation's Receipt --
+        e.g. why the grant is being revoked. Purely optional and
+        inert: it can never affect whether the revoke is accepted.
         """
 
         operation_id = new_id("operation")
@@ -917,6 +1018,21 @@ class Kernel:
                     ),
                 )
 
+                for evidence_id in evidence_ids or []:
+                    conn.execute(
+                        """
+                        INSERT INTO receipt_evidence (
+                            receipt_id,
+                            evidence_id
+                        )
+                        VALUES (?, ?)
+                        """,
+                        (
+                            receipt_id,
+                            evidence_id,
+                        ),
+                    )
+
             return {
                 "operation_id": operation_id,
                 "grant_id": grant_id,
@@ -928,6 +1044,7 @@ class Kernel:
                 operation_id=operation_id,
                 outcome="REJECTED",
                 reason=str(exc),
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -942,6 +1059,7 @@ class Kernel:
                 details={
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -958,6 +1076,7 @@ class Kernel:
                     "exception_type": type(exc).__name__,
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -972,6 +1091,7 @@ class Kernel:
         authority_grant_id: str,
         identity_id: str,
         reason: str | None = None,
+        evidence_ids: list[str] | None = None,
     ) -> dict[str, str]:
         """
         Revoke every grant an identity holds as of this operation.
@@ -996,6 +1116,11 @@ class Kernel:
         invalidated; a grant created after this receipt for the same
         identity is unaffected -- this revokes what existed at this
         moment, it does not ban the identity going forward.
+
+        evidence_ids optionally cites already-admitted Evidence (see
+        record_evidence()) in support of this operation's Receipt.
+        Purely optional and inert: it can never affect whether the
+        revoke_all is accepted.
         """
 
         operation_id = new_id("operation")
@@ -1093,6 +1218,21 @@ class Kernel:
                     ),
                 )
 
+                for evidence_id in evidence_ids or []:
+                    conn.execute(
+                        """
+                        INSERT INTO receipt_evidence (
+                            receipt_id,
+                            evidence_id
+                        )
+                        VALUES (?, ?)
+                        """,
+                        (
+                            receipt_id,
+                            evidence_id,
+                        ),
+                    )
+
             return {
                 "operation_id": operation_id,
                 "identity_id": identity_id,
@@ -1104,6 +1244,7 @@ class Kernel:
                 operation_id=operation_id,
                 outcome="REJECTED",
                 reason=str(exc),
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -1118,6 +1259,7 @@ class Kernel:
                 details={
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -1134,6 +1276,7 @@ class Kernel:
                     "exception_type": type(exc).__name__,
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -1149,6 +1292,7 @@ class Kernel:
         authority_id: str,
         is_root: bool = False,
         payload: dict[str, Any] | None = None,
+        evidence_ids: list[str] | None = None,
     ) -> dict[str, str]:
         """
         Define a new authority. is_root sets the kernel-enforced
@@ -1170,6 +1314,11 @@ class Kernel:
         grant with no check at all. It is now its own explicit,
         root-only Authority operation, with no State transition
         involved, matching grant/revoke/revoke_all.
+
+        evidence_ids optionally cites already-admitted Evidence (see
+        record_evidence()) in support of this operation's Receipt.
+        Purely optional and inert: it can never affect whether the
+        authority definition is accepted.
         """
 
         operation_id = new_id("operation")
@@ -1250,9 +1399,223 @@ class Kernel:
                     ),
                 )
 
+                for evidence_id in evidence_ids or []:
+                    conn.execute(
+                        """
+                        INSERT INTO receipt_evidence (
+                            receipt_id,
+                            evidence_id
+                        )
+                        VALUES (?, ?)
+                        """,
+                        (
+                            receipt_id,
+                            evidence_id,
+                        ),
+                    )
+
             return {
                 "operation_id": operation_id,
                 "authority_id": authority_id,
+                "receipt_id": receipt_id,
+            }
+
+        except KernelError as exc:
+            receipt_id = self.record_failure(
+                operation_id=operation_id,
+                outcome="REJECTED",
+                reason=str(exc),
+                evidence_ids=evidence_ids,
+            )
+
+            raise KernelError(
+                f"{exc} [receipt={receipt_id}]"
+            ) from exc
+
+        except sqlite3.IntegrityError as exc:
+            receipt_id = self.record_failure(
+                operation_id=operation_id,
+                outcome="FAILED",
+                reason="sqlite integrity failure",
+                details={
+                    "error": str(exc),
+                },
+                evidence_ids=evidence_ids,
+            )
+
+            raise KernelError(
+                f"sqlite integrity failure "
+                f"[receipt={receipt_id}]"
+            ) from exc
+
+        except Exception as exc:
+            receipt_id = self.record_failure(
+                operation_id=operation_id,
+                outcome="FAILED",
+                reason="unexpected kernel operation failure",
+                details={
+                    "exception_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                evidence_ids=evidence_ids,
+            )
+
+            raise KernelError(
+                f"unexpected kernel operation failure "
+                f"[receipt={receipt_id}]"
+            ) from exc
+
+    # ---------------------------------------------------------
+    # EVIDENCE
+    # ---------------------------------------------------------
+    #
+    # record_evidence() is Evidence's own admission/existence
+    # operation -- distinct from receipt_evidence, which is
+    # ASSOCIATION of already-existing Evidence with some OTHER,
+    # possibly-later operation's Receipt (see the evidence_ids
+    # parameter on transition/grant/revoke/revoke_all/
+    # define_authority above).
+    #
+    # Deliberately NOT root-gated: unlike grant/revoke/revoke_all/
+    # define_authority (which alter the capability graph itself and
+    # so require root, closing the amplification question), admitting
+    # Evidence cannot grant Authority, alter State, or validate an
+    # otherwise-invalid operation -- it is inert reference material
+    # (see transition()'s own evidence_ids, likewise open to any
+    # currently-valid grant). Any currently-valid grant, root or not,
+    # may call this -- same authorization bar as transition(), not the
+    # Authority-admin bar.
+    #
+    # This method does NOT create a receipt_evidence row linking the
+    # new Evidence to its own creation Receipt. Provenance of WHO
+    # admitted this Evidence and WHEN lives entirely in this
+    # operation's own kernel-authored receipt payload (action,
+    # evidence_id, authority_grant_id, caused_by_identity_id) --
+    # exactly the same place transition()'s provenance lives
+    # (identity_id/requester_identity_id in the transition's own
+    # receipt payload, not some separate junction row) -- and exactly
+    # why the evidence/states tables carry no created_by column of
+    # their own: creation provenance belongs to the operation that
+    # produced the row, not the row itself.
+    #
+    # Self-linking the creation receipt to its own evidence was
+    # considered and rejected: receipt_evidence is defined to mean
+    # "Evidence E was cited/submitted in SUPPORT of Receipt R" (R
+    # belongs to some other, later operation this Evidence was offered
+    # alongside). A creation receipt's relationship to the Evidence it
+    # just brought into existence is the opposite relationship (R
+    # produced E, E does not support R) -- collapsing both into one
+    # junction table would make every future "what evidence supports
+    # this receipt" query ambiguous for exactly one row per Evidence
+    # object: its own birth receipt. Kernel-mechanically this creates
+    # no authority or validity problem (nothing reads receipt_evidence
+    # to make a decision -- see the evidence-is-inert guarantee tested
+    # throughout this file), but it is an avoidable modeling defect,
+    # so it is avoided.
+
+    def record_evidence(
+        self,
+        *,
+        requester_identity_id: str,
+        authority_grant_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, str]:
+        """
+        Admit a new immutable Evidence object.
+
+        This is Evidence's existence/admission operation. It says
+        nothing about what the evidence is offered in support of --
+        that is a separate, later act of ASSOCIATION (see
+        evidence_ids on transition/grant/revoke/revoke_all/
+        define_authority), performed by naming this evidence_id when
+        some other operation is attempted. A freshly admitted
+        evidence_id cannot be cited by anything until this call has
+        committed -- association always happens strictly after
+        admission, never inside the same transaction, so there is no
+        same-call recursion to reason about.
+
+        requester_identity_id must hold authority_grant_id, and that
+        grant must be currently valid -- but need NOT be root. See
+        the class comment above for why.
+
+        payload is opaque caller-supplied material or a reference to
+        material. The kernel does not interpret it, verify it, or
+        assert it is true, authentic, relevant, or that anything it
+        references still exists.
+        """
+
+        operation_id = new_id("operation")
+
+        try:
+            if not requester_identity_id:
+                raise AuthorityError(
+                    "requester_identity_id is required"
+                )
+
+            if payload is None:
+                raise StateError(
+                    "evidence payload is required (may be an empty "
+                    "object, but not omitted)"
+                )
+
+            new_evidence_id = new_id("evidence")
+            created_at = utc_now()
+            receipt_id = new_id("receipt")
+
+            with self.transaction() as conn:
+                grant = self._validate_grant(
+                    conn,
+                    authority_grant_id,
+                    requester_identity_id=requester_identity_id,
+                )
+
+                conn.execute(
+                    """
+                    INSERT INTO evidence (
+                        evidence_id,
+                        created_at,
+                        payload
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        new_evidence_id,
+                        created_at,
+                        encode_payload(payload),
+                    ),
+                )
+
+                conn.execute(
+                    """
+                    INSERT INTO receipts (
+                        receipt_id,
+                        operation_id,
+                        transition_id,
+                        outcome,
+                        created_at,
+                        payload
+                    )
+                    VALUES (?, ?, NULL, 'ACCEPTED', ?, ?)
+                    """,
+                    (
+                        receipt_id,
+                        operation_id,
+                        created_at,
+                        encode_payload(
+                            {
+                                "action": "RECORD_EVIDENCE",
+                                "evidence_id": new_evidence_id,
+                                "authority_grant_id": authority_grant_id,
+                                "caused_by_identity_id":
+                                    grant["identity_id"],
+                            }
+                        ),
+                    ),
+                )
+
+            return {
+                "operation_id": operation_id,
+                "evidence_id": new_evidence_id,
                 "receipt_id": receipt_id,
             }
 
@@ -1516,23 +1879,6 @@ class Kernel:
                     ),
                 )
 
-                # Evidence references.
-
-                for evidence_id in evidence_ids:
-                    conn.execute(
-                        """
-                        INSERT INTO transition_evidence (
-                            transition_id,
-                            evidence_id
-                        )
-                        VALUES (?, ?)
-                        """,
-                        (
-                            transition_id,
-                            evidence_id,
-                        ),
-                    )
-
                 # Invariant references.
 
                 for invariant_id in invariant_ids:
@@ -1550,7 +1896,12 @@ class Kernel:
                         ),
                     )
 
-                # Success receipt.
+                # Success receipt. Must be inserted BEFORE the evidence
+                # links below -- receipt_evidence.receipt_id is a
+                # foreign key into receipts, and SQLite checks foreign
+                # keys immediately per-statement (not deferred), so the
+                # receipt row must already exist in this same
+                # transaction before anything can reference it.
 
                 conn.execute(
                     """
@@ -1579,6 +1930,29 @@ class Kernel:
                         ),
                     )
                 )
+
+                # Evidence references -- linked to this transition's
+                # success RECEIPT, not the transition row itself, so
+                # the same mechanism also works for Authority-operation
+                # receipts and REJECTED/FAILED receipts (see
+                # record_failure). Inserted after the receipt row above
+                # so the receipt_evidence.receipt_id foreign key always
+                # resolves.
+
+                for evidence_id in evidence_ids:
+                    conn.execute(
+                        """
+                        INSERT INTO receipt_evidence (
+                            receipt_id,
+                            evidence_id
+                        )
+                        VALUES (?, ?)
+                        """,
+                        (
+                            receipt_id,
+                            evidence_id,
+                        ),
+                    )
             return {
                 "operation_id": operation_id,
                 "state_id": state_id,
@@ -1591,6 +1965,7 @@ class Kernel:
                 operation_id=operation_id,
                 outcome="REJECTED",
                 reason=str(exc),
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -1605,6 +1980,7 @@ class Kernel:
                 details={
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
@@ -1621,12 +1997,13 @@ class Kernel:
                     "exception_type": type(exc).__name__,
                     "error": str(exc),
                 },
+                evidence_ids=evidence_ids,
             )
 
             raise KernelError(
                 f"unexpected kernel operation failure "
                 f"[receipt={receipt_id}]"
-            ) from exc 
+            ) from exc
 
 # -------------------------------------------------------------
 # Minimal command-line smoke test
