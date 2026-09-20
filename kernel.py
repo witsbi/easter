@@ -603,6 +603,18 @@ class Kernel:
 
         This creates no state and no authoritative transition.
 
+        The Receipt this produces is deliberately minimal: only
+        `reason`, a short kernel-authored classification string (e.g.
+        "sqlite integrity failure"), never the caller-supplied
+        `details` dict. `details` (raw exception type/message/context)
+        is Exception-owned diagnostic information -- it goes into the
+        Exception's own payload only. Receipt records that an
+        Exception occurred and that the operation failed; Exception
+        owns explaining why. The two remain linked through
+        exceptions.receipt_id (see the exceptions table), which this
+        method always populates, regardless of what caused the
+        failure.
+
         evidence_ids lets a caller preserve Evidence it submitted
         alongside the now-failed attempt (see transition()/grant()/
         revoke()/revoke_all()/define_authority()) by linking it to
@@ -635,9 +647,6 @@ class Kernel:
         receipt_payload = {
             "reason": reason,
         }
-
-        if details:
-            receipt_payload["details"] = details
 
         with self.transaction() as conn:
             requested_evidence_ids = evidence_ids or []
