@@ -42,11 +42,20 @@ CREATE TABLE identities (
 --
 -- Authority definition and authority possession are intentionally
 -- separate concepts.
+--
+-- is_root is a kernel-mechanically-enforced property, not opaque
+-- userland meaning: it gates define_authority/grant/revoke/
+-- revoke_all and participates in the last-valid-root invariant (see
+-- kernel.py). That is exactly the "columns exist for properties the
+-- kernel must mechanically enforce" rule, so it is a column, not a
+-- reserved payload key. It is the ONLY kernel source of truth for
+-- root status -- there is no fallback to payload, by design.
 -- ============================================================
 
 CREATE TABLE authorities (
     authority_id    TEXT PRIMARY KEY,
     created_at      TEXT NOT NULL,
+    is_root         INTEGER NOT NULL DEFAULT 0 CHECK (is_root IN (0, 1)),
     payload         TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -228,7 +237,11 @@ CREATE TABLE transition_evidence (
 -- Immutable receipt for a kernel operation.
 --
 -- A receipt may reference a committed transition, but does not
--- have to. Failed operations have no authoritative transition.
+-- have to -- an ACCEPTED Authority operation (grant/revoke/
+-- revoke_all) has no transition at all, and is described entirely
+-- by its own opaque payload, the same way transitions already
+-- describe supersession-like facts in their own payload. Failed
+-- operations never have an authoritative transition.
 --
 -- operation_id lets the receipt refer to the attempted operation
 -- without pretending that attempt became authoritative state.
@@ -254,7 +267,7 @@ CREATE TABLE receipts (
     )),
 
     CHECK (
-        (outcome = 'ACCEPTED' AND transition_id IS NOT NULL)
+        outcome = 'ACCEPTED'
         OR
         (outcome IN ('BOOTSTRAP', 'REJECTED', 'FAILED') AND transition_id IS NULL)
     )
