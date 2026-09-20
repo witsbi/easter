@@ -104,17 +104,33 @@ CREATE TABLE authority_grants (
 --
 -- An immutable committed state.
 --
--- parent_state_id provides lineage.
+-- Lineage is represented exclusively by transitions.from_state_id ->
+-- transitions.to_state_id, never by a column on this table --
+-- states.parent_state_id was deliberately removed. Genesis
+-- (state:genesis, seeded by genesis_seed.sql) is the one state with
+-- no incoming transition; it is identified by that literal ID, not
+-- by any structural marker on this table.
 --
--- NULL parent_state_id is permitted for genesis/root states.
+-- Duplicate/replayed transition() calls from the same from_state_id
+-- are not deduplicated here or anywhere else: each accepted call
+-- commits its own distinct state and is a valid separate branch.
+-- The kernel has no canonical-head/current-state concept and does
+-- not merge branches -- which branch to continue from is entirely a
+-- userland choice, made per call, forever.
 --
--- State meaning belongs entirely to payload.
+-- State meaning belongs entirely to payload. Being valid JSON is a
+-- kernel representation invariant, not interpretation of userland
+-- meaning -- enforced structurally here via json_valid(), the same
+-- split already used for is_root (mechanically-enforced properties
+-- get SQL, not just Python, enforcement). This is a backstop against
+-- direct-SQL boundary violations; encode_payload already guarantees
+-- valid JSON for every write that goes through the kernel.
 -- ============================================================
 
 CREATE TABLE states (
     state_id         TEXT PRIMARY KEY,
     created_at       TEXT NOT NULL,
-    payload          TEXT NOT NULL
+    payload          TEXT NOT NULL CHECK (json_valid(payload))
 );
 
 

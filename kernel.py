@@ -1343,6 +1343,19 @@ class Kernel:
 
         On validation failure, no authoritative state changes.
         A separate rejection receipt/exception is recorded.
+
+        Replay/branching (frozen State design decision): this method
+        performs no deduplication. Calling it twice with identical
+        arguments -- e.g. a naive retry after a timeout -- commits
+        two distinct states, each a valid separate branch from the
+        same from_state_id; neither is preferred, and the kernel does
+        not merge them. There is no canonical-head/current-state
+        concept anywhere in this kernel -- which state_id to continue
+        from on the next call is entirely a userland decision, made
+        fresh each time. If userland cannot resolve which of several
+        branches to continue from, that escalation (e.g. to Nathan/
+        root) happens entirely outside the kernel; the kernel has no
+        role in choosing and enforces none.
         """
 
         operation_id = new_id("operation")
