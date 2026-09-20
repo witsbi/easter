@@ -397,14 +397,23 @@ CREATE TABLE receipts (
 -- Immutable record describing why an operation failed.
 --
 -- Exceptions are receipts/evidence of failure, not mutations of
--- authoritative state.
+-- authoritative state. Exception owns diagnostic failure detail
+-- (type/message/context) -- see Kernel.record_failure(), which keeps
+-- the FAILED Receipt itself to a minimal kernel-authored `reason`.
+--
+-- payload has CHECK(json_valid(...)) for the same reason receipts.
+-- payload/states.payload do: a kernel representation invariant, not
+-- userland interpretation, enforced structurally as a backstop
+-- against direct-SQL boundary violations (encode_payload already
+-- guarantees valid JSON for every write that goes through the
+-- kernel). This adds no semantic interpretation of Exception content.
 -- ============================================================
 
 CREATE TABLE exceptions (
     exception_id     TEXT PRIMARY KEY,
     receipt_id       TEXT NOT NULL,
     created_at       TEXT NOT NULL,
-    payload          TEXT NOT NULL,
+    payload          TEXT NOT NULL CHECK (json_valid(payload)),
 
     FOREIGN KEY (receipt_id)
         REFERENCES receipts(receipt_id),
