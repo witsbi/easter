@@ -51,12 +51,12 @@ with tempfile.NamedTemporaryFile(prefix="receipt-minimality-", suffix=".db") as 
             from_state_id=GENESIS,
             authority_grant_id=ROOT,
             new_state_payload={"probe": "receipt-2-minimality"},
-            invariant_ids=["invariant:does-not-exist-receipt-2"],
+            evidence_ids=["evidence:does-not-exist-receipt-2"],
         )
     except KernelError as exc:
         assert "receipt=" in str(exc)
     else:
-        raise AssertionError("dangling invariant_id must reject transition()")
+        raise AssertionError("dangling evidence_id must reject transition()")
 
     with kernel.connect() as conn:
         after = counts(conn)
