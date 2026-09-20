@@ -71,10 +71,21 @@ CREATE TABLE authorities (
 -- handling.
 --
 -- Revocation/supersession is NOT represented by mutating this row.
--- A later authoritative record must represent that change.
+-- A later authoritative record -- see authority_grant_revocations
+-- below -- represents that change instead.
+--
+-- authority_seq is Authority's own append-only kernel-order sequence,
+-- shared with authority_grant_revocations (a grant and a revocation
+-- are directly comparable by this integer). It is populated by
+-- Kernel._next_authority_seq() inside the writer's own serialized
+-- transaction, never by wall-clock created_at and never by
+-- receipts.receipt_seq -- Authority validity is Authority-owned data;
+-- Receipt is deliberately kept out of computing it (see
+-- authority_grant_revocations and Kernel._is_grant_revoked).
 
 CREATE TABLE authority_grants (
     grant_id                TEXT PRIMARY KEY,
+    authority_seq           INTEGER NOT NULL UNIQUE,
     identity_id             TEXT NOT NULL,
     authority_id            TEXT NOT NULL,
     granted_by_identity_id  TEXT,
@@ -95,6 +106,66 @@ CREATE TABLE authority_grants (
     CHECK (
         expires_at IS NULL
         OR expires_at > valid_from
+    )
+);
+
+
+-- ============================================================
+-- AUTHORITY GRANT REVOCATIONS
+-- ============================================================
+--
+-- Immutable Authority-owned record that a grant (REVOKE) or every
+-- grant an identity held as of this record (REVOKE_ALL) is no longer
+-- valid. This is Authority's own append-only ledger entry for
+-- revocation -- the counterpart to authority_grants for grant
+-- issuance -- so Authority validity never depends on interpreting
+-- receipts.payload (see Kernel._is_grant_revoked). The target grant's
+-- own row in authority_grants is never mutated or deleted.
+--
+-- authority_seq shares one sequence space with authority_grants (see
+-- that table's comment): REVOKE_ALL's "every grant this identity held
+-- as of this moment" is evaluated by comparing a candidate grant's
+-- authority_seq against this row's authority_seq, never by comparing
+-- created_at wall-clock strings. This is what closes the clock-skew
+-- exploit found during the Receipt red-team: a grant's position in
+-- Authority's own kernel-ordered ledger is fixed the instant it
+-- commits and cannot be reordered by clock skew on either side.
+--
+-- grant_id is set (and identity_id NULL) for a REVOKE record;
+-- identity_id is set (and grant_id NULL) for a REVOKE_ALL record.
+-- authority_grant_id records the root grant exercised to cause this
+-- revocation -- same convention as transitions.authority_grant_id.
+-- ============================================================
+
+CREATE TABLE authority_grant_revocations (
+    revocation_id           TEXT PRIMARY KEY,
+    authority_seq           INTEGER NOT NULL UNIQUE,
+    kind                    TEXT NOT NULL,
+    grant_id                TEXT,
+    identity_id             TEXT,
+    caused_by_identity_id   TEXT NOT NULL,
+    authority_grant_id      TEXT NOT NULL,
+    created_at              TEXT NOT NULL,
+    payload                 TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
+
+    FOREIGN KEY (grant_id)
+        REFERENCES authority_grants(grant_id),
+
+    FOREIGN KEY (identity_id)
+        REFERENCES identities(identity_id),
+
+    FOREIGN KEY (caused_by_identity_id)
+        REFERENCES identities(identity_id),
+
+    FOREIGN KEY (authority_grant_id)
+        REFERENCES authority_grants(grant_id),
+
+    CHECK (kind IN ('REVOKE', 'REVOKE_ALL')),
+
+    CHECK (
+        (kind = 'REVOKE' AND grant_id IS NOT NULL AND identity_id IS NULL)
+        OR
+        (kind = 'REVOKE_ALL' AND identity_id IS NOT NULL AND grant_id IS NULL)
     )
 );
 
@@ -270,15 +341,26 @@ CREATE TABLE receipt_evidence (
 --
 -- Immutable receipt for a kernel operation.
 --
--- A receipt may reference a committed transition, but does not
--- have to -- an ACCEPTED Authority operation (grant/revoke/
--- revoke_all) has no transition at all, and is described entirely
--- by its own opaque payload, the same way transitions already
--- describe supersession-like facts in their own payload. Failed
--- operations never have an authoritative transition.
+-- A receipt may reference a committed transition, but does not have
+-- to -- an ACCEPTED Authority operation (grant/revoke/revoke_all) has
+-- no transition at all. Its payload names the Authority record(s)
+-- (authority_grants/authority_grant_revocations row ids) the
+-- operation produced, for provenance/navigation only -- the Receipt
+-- records that the kernel did this; it does not itself establish
+-- Authority validity. That is Authority-owned data (see
+-- authority_grants.authority_seq and authority_grant_revocations,
+-- and Kernel._is_grant_revoked, which reads only those tables).
+-- Failed operations never have an authoritative transition or
+-- Authority record.
 --
 -- operation_id lets the receipt refer to the attempted operation
 -- without pretending that attempt became authoritative state.
+--
+-- payload has CHECK(json_valid(...)) for the same reason states.
+-- payload does: a kernel representation invariant, not userland
+-- interpretation, enforced structurally as a backstop against
+-- direct-SQL boundary violations (encode_payload already guarantees
+-- valid JSON for every write that goes through the kernel).
 -- ============================================================
 
 CREATE TABLE receipts (
@@ -288,7 +370,7 @@ CREATE TABLE receipts (
     transition_id    TEXT,
     outcome          TEXT NOT NULL,
     created_at       TEXT NOT NULL,
-    payload          TEXT NOT NULL DEFAULT '{}',
+    payload          TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(payload)),
 
     FOREIGN KEY (transition_id)
         REFERENCES transitions(transition_id),
@@ -340,6 +422,12 @@ CREATE INDEX idx_authority_grants_identity
 
 CREATE INDEX idx_authority_grants_authority
     ON authority_grants(authority_id);
+
+CREATE INDEX idx_authority_grant_revocations_grant
+    ON authority_grant_revocations(grant_id);
+
+CREATE INDEX idx_authority_grant_revocations_identity
+    ON authority_grant_revocations(identity_id);
 
 CREATE INDEX idx_transitions_from_state
     ON transitions(from_state_id);
@@ -412,6 +500,23 @@ BEFORE DELETE ON authority_grants
 BEGIN
     SELECT RAISE(ABORT,
         'kernel violation: authority grants are append-only');
+END;
+
+
+-- authority_grant_revocations
+
+CREATE TRIGGER authority_grant_revocations_no_update
+BEFORE UPDATE ON authority_grant_revocations
+BEGIN
+    SELECT RAISE(ABORT,
+        'kernel violation: authority grant revocations are immutable');
+END;
+
+CREATE TRIGGER authority_grant_revocations_no_delete
+BEFORE DELETE ON authority_grant_revocations
+BEGIN
+    SELECT RAISE(ABORT,
+        'kernel violation: authority grant revocations are append-only');
 END;
 
 

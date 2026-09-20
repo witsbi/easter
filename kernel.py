@@ -187,6 +187,7 @@ class Kernel:
             """
             SELECT
                 grant_id,
+                authority_seq,
                 identity_id,
                 authority_id,
                 granted_by_identity_id,
@@ -205,6 +206,7 @@ class Kernel:
 
         return {
             "grant_id": row["grant_id"],
+            "authority_seq": row["authority_seq"],
             "identity_id": row["identity_id"],
             "authority_id": row["authority_id"],
             "granted_by_identity_id": row["granted_by_identity_id"],
@@ -236,6 +238,40 @@ class Kernel:
     # above/below remain for read-only inspection (tests, evidence,
     # CLI) where no write transaction is being held.
 
+    def _next_authority_seq(self, conn: sqlite3.Connection) -> int:
+        """
+        Next value in Authority's own append-only kernel-order
+        sequence, shared across authority_grants and
+        authority_grant_revocations so a grant and a revocation are
+        directly comparable by plain integer comparison -- never by
+        wall-clock created_at, and deliberately never by
+        receipts.receipt_seq either (Receipt's own sequence stays out
+        of Authority's validity determination entirely; see
+        _is_grant_revoked and the Receipt red-team remediation this
+        replaced).
+
+        Safe to compute via MAX(...)+1 here specifically because
+        every caller (grant/revoke/revoke_all) holds this conn's
+        BEGIN IMMEDIATE write lock already -- the same
+        single-writer-serialization guarantee _validate_grant's
+        docstring relies on -- so no concurrent writer can insert a
+        competing value in the gap between this read and this
+        transaction's own insert.
+        """
+
+        row = conn.execute(
+            """
+            SELECT COALESCE(MAX(authority_seq), 0) AS max_seq
+            FROM (
+                SELECT authority_seq FROM authority_grants
+                UNION ALL
+                SELECT authority_seq FROM authority_grant_revocations
+            )
+            """
+        ).fetchone()
+
+        return row["max_seq"] + 1
+
     def _is_grant_revoked(
         self, conn: sqlite3.Connection, grant_id: str
     ) -> bool:
@@ -243,30 +279,36 @@ class Kernel:
         Whether a standalone Authority REVOKE or REVOKE_ALL operation
         (see revoke/revoke_all below) has invalidated this grant.
 
-        This uses no schema beyond the existing receipts table.
-        receipts.payload is already opaque, kernel-agnostic JSON
-        (design principle 5: "userland meaning lives in JSON
-        payloads, not schema"). An ACCEPTED receipt may carry a
-        reserved "action" key of "REVOKE" or "REVOKE_ALL"; this is a
-        Python-side *semantic* law (design principle 4), not a
-        structural one, so it is evaluated here rather than in
-        SQLite. Only ACCEPTED receipts are considered -- a rejected
-        or failed revoke attempt never counts.
+        Reads authority_grant_revocations ONLY -- an Authority-owned,
+        append-only table -- never receipts. Authority validity is
+        Authority-owned data; Receipt records what the kernel did, it
+        is not (and, before this fix, should never have been) the
+        place Authority validity gets computed from.
+
+        The previous version of this method derived revocation
+        entirely by scanning receipts.payload for a reserved "action"
+        key, which made Receipt Authority's sole source of truth for
+        this fact, and ordered REVOKE_ALL coverage by comparing
+        receipt.created_at (wall-clock, captured before the writer's
+        BEGIN IMMEDIATE lock) against a grant's created_at. Simulated
+        clock skew empirically reproduced both a false-positive (a
+        grant issued after a revoke_all treated as already-revoked)
+        and a real bypass (a grant that existed and was exercised
+        before a revoke_all survived it, with the revoke_all's own
+        receipt still reporting ACCEPTED). See the Receipt red-team
+        findings and migrate_authority_append_only_revocations.sql.
 
         REVOKE names one grant_id directly: permanent, unconditional.
 
         REVOKE_ALL names one identity_id: every grant that identity
-        held as of that receipt's created_at becomes invalid. A
-        grant created AFTER that receipt for the same identity is
+        held as of that revocation's authority_seq becomes invalid.
+        A grant created after that revocation's authority_seq is
         unaffected -- REVOKE_ALL revokes what existed at that moment,
-        it does not ban the identity going forward.
-
-        This replaces the removed is_grant_superseded/
-        supersedes_grant_ids mechanism, which coupled revocation to
-        State transitions. Revocation is now independent of State
-        entirely, evaluated purely against wall-clock receipt
-        history -- never against State lineage or which branch/State
-        an operation is being attempted from.
+        it does not ban the identity going forward. Compared using
+        authority_seq (Authority's own append-only kernel-order
+        sequence, shared across authority_grants and
+        authority_grant_revocations -- see _next_authority_seq),
+        never wall-clock created_at.
         """
 
         grant = self._get_grant(conn, grant_id)
@@ -274,31 +316,31 @@ class Kernel:
         if grant is None:
             return False
 
-        grant_created_at = parse_timestamp(grant["created_at"])
-
-        rows = conn.execute(
+        direct = conn.execute(
             """
-            SELECT created_at, payload
-            FROM receipts
-            WHERE outcome = 'ACCEPTED'
+            SELECT 1
+            FROM authority_grant_revocations
+            WHERE kind = 'REVOKE'
+              AND grant_id = ?
+            """,
+            (grant_id,),
+        ).fetchone()
+
+        if direct is not None:
+            return True
+
+        bulk = conn.execute(
             """
-        ).fetchall()
+            SELECT 1
+            FROM authority_grant_revocations
+            WHERE kind = 'REVOKE_ALL'
+              AND identity_id = ?
+              AND authority_seq >= ?
+            """,
+            (grant["identity_id"], grant["authority_seq"]),
+        ).fetchone()
 
-        for row in rows:
-            payload = json.loads(row["payload"])
-            action = payload.get("action")
-
-            if action == "REVOKE" and payload.get("grant_id") == grant_id:
-                return True
-
-            if (
-                action == "REVOKE_ALL"
-                and payload.get("identity_id") == grant["identity_id"]
-                and grant_created_at <= parse_timestamp(row["created_at"])
-            ):
-                return True
-
-        return False
+        return bulk is not None
 
     def is_grant_revoked(self, grant_id: str) -> bool:
         with self.connect() as conn:
@@ -698,12 +740,16 @@ class Kernel:
     # in their own right. None of them require or produce a State
     # transition -- Authority is an independent lifecycle from State.
     #
-    # Each writes into existing tables only (authority_grants,
-    # receipts) and follows the same atomicity/failure-receipt
+    # Each writes into Authority-owned tables (authority_grants for
+    # grant; authority_grant_revocations for revoke/revoke_all) plus
+    # receipts, and follows the same atomicity/failure-receipt
     # pattern as transition() below: on success, the authoritative
-    # write and its ACCEPTED receipt commit together; on failure, no
-    # authoritative write happens and a REJECTED/FAILED receipt
-    # records why.
+    # write(s) and their ACCEPTED receipt commit together, in that
+    # order -- Authority record(s) first, receipt referencing them
+    # second, since the receipt is provenance about the Authority
+    # change, not the source of it (see _is_grant_revoked). On
+    # failure, no authoritative write happens and a REJECTED/FAILED
+    # receipt records why.
 
     def grant(
         self,
@@ -789,10 +835,13 @@ class Kernel:
                         f"authority does not exist: {authority_id}"
                     )
 
+                new_authority_seq = self._next_authority_seq(conn)
+
                 conn.execute(
                     """
                     INSERT INTO authority_grants (
                         grant_id,
+                        authority_seq,
                         identity_id,
                         authority_id,
                         granted_by_identity_id,
@@ -801,10 +850,11 @@ class Kernel:
                         expires_at,
                         payload
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         new_grant_id,
+                        new_authority_seq,
                         identity_id,
                         authority_id,
                         requester_identity_id,
@@ -937,11 +987,15 @@ class Kernel:
 
         The target grant's row in authority_grants is never mutated
         or deleted -- revocation is recorded entirely as a new,
-        separate, immutable ACCEPTED receipt with a reserved
-        "action": "REVOKE" payload key. See is_grant_revoked for how
-        this is read back. This is permanent and unconditional: once
-        revoked, grant_id can never again authorize an operation,
-        regardless of which State or branch the attempt is made from.
+        separate, immutable Authority-owned row in
+        authority_grant_revocations (kind='REVOKE'), which is what
+        is_grant_revoked reads back; the ACCEPTED receipt this
+        operation also produces references that row for provenance
+        only, it does not itself establish revocation (see the
+        Receipt red-team remediation). This is permanent and
+        unconditional: once revoked, grant_id can never again
+        authorize an operation, regardless of which State or branch
+        the attempt is made from.
 
         evidence_ids optionally cites already-admitted Evidence (see
         record_evidence()) in support of this operation's Receipt --
@@ -959,6 +1013,7 @@ class Kernel:
 
             created_at = utc_now()
             receipt_id = new_id("receipt")
+            revocation_id = new_id("revocation")
 
             with self.transaction() as conn:
                 self._validate_root_grant(
@@ -987,8 +1042,49 @@ class Kernel:
                             f"leave the kernel with zero root grants"
                         )
 
+                revocation_payload = {}
+
+                if reason:
+                    revocation_payload["reason"] = reason
+
+                # Authoritative Authority record. Inserted BEFORE the
+                # receipt below -- this is the actual authoritative
+                # change; the receipt only references it for
+                # provenance (see _is_grant_revoked/red-team
+                # remediation: Authority validity must never be
+                # computed by interpreting receipts.payload).
+
+                new_authority_seq = self._next_authority_seq(conn)
+
+                conn.execute(
+                    """
+                    INSERT INTO authority_grant_revocations (
+                        revocation_id,
+                        authority_seq,
+                        kind,
+                        grant_id,
+                        identity_id,
+                        caused_by_identity_id,
+                        authority_grant_id,
+                        created_at,
+                        payload
+                    )
+                    VALUES (?, ?, 'REVOKE', ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        revocation_id,
+                        new_authority_seq,
+                        grant_id,
+                        requester_identity_id,
+                        authority_grant_id,
+                        created_at,
+                        encode_payload(revocation_payload),
+                    ),
+                )
+
                 receipt_payload = {
                     "action": "REVOKE",
+                    "revocation_id": revocation_id,
                     "grant_id": grant_id,
                     "identity_id": target_grant["identity_id"],
                     "authority_grant_id": authority_grant_id,
@@ -1109,13 +1205,17 @@ class Kernel:
         for the whole set before anything commits, inside the same
         serialized transaction as the operation itself.
 
-        Recorded as a single immutable ACCEPTED receipt with a
-        reserved "action": "REVOKE_ALL" payload key naming
+        Recorded as a single immutable Authority-owned row in
+        authority_grant_revocations (kind='REVOKE_ALL') naming
         identity_id. See is_grant_revoked for how this is read back:
-        every grant with created_at <= this receipt's created_at is
-        invalidated; a grant created after this receipt for the same
-        identity is unaffected -- this revokes what existed at this
-        moment, it does not ban the identity going forward.
+        every grant with authority_seq <= this row's authority_seq is
+        invalidated; a grant created after this row (in Authority's
+        own kernel-order sequence, never wall-clock time) for the
+        same identity is unaffected -- this revokes what existed at
+        this moment, it does not ban the identity going forward. The
+        ACCEPTED receipt this operation also produces references that
+        row for provenance only; it does not itself establish
+        revocation (see the Receipt red-team remediation).
 
         evidence_ids optionally cites already-admitted Evidence (see
         record_evidence()) in support of this operation's Receipt.
@@ -1136,16 +1236,7 @@ class Kernel:
 
             created_at = utc_now()
             receipt_id = new_id("receipt")
-
-            receipt_payload = {
-                "action": "REVOKE_ALL",
-                "identity_id": identity_id,
-                "authority_grant_id": authority_grant_id,
-                "caused_by_identity_id": requester_identity_id,
-            }
-
-            if reason:
-                receipt_payload["reason"] = reason
+            revocation_id = new_id("revocation")
 
             with self.transaction() as conn:
                 self._validate_root_grant(
@@ -1197,6 +1288,55 @@ class Kernel:
                         f"operation may leave the kernel with zero "
                         f"root grants"
                     )
+
+                revocation_payload = {}
+
+                if reason:
+                    revocation_payload["reason"] = reason
+
+                # Authoritative Authority record. Inserted BEFORE the
+                # receipt below -- same reasoning as revoke() (see
+                # its comment): the receipt only references this row
+                # for provenance, it does not establish revocation.
+
+                new_authority_seq = self._next_authority_seq(conn)
+
+                conn.execute(
+                    """
+                    INSERT INTO authority_grant_revocations (
+                        revocation_id,
+                        authority_seq,
+                        kind,
+                        grant_id,
+                        identity_id,
+                        caused_by_identity_id,
+                        authority_grant_id,
+                        created_at,
+                        payload
+                    )
+                    VALUES (?, ?, 'REVOKE_ALL', NULL, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        revocation_id,
+                        new_authority_seq,
+                        identity_id,
+                        requester_identity_id,
+                        authority_grant_id,
+                        created_at,
+                        encode_payload(revocation_payload),
+                    ),
+                )
+
+                receipt_payload = {
+                    "action": "REVOKE_ALL",
+                    "revocation_id": revocation_id,
+                    "identity_id": identity_id,
+                    "authority_grant_id": authority_grant_id,
+                    "caused_by_identity_id": requester_identity_id,
+                }
+
+                if reason:
+                    receipt_payload["reason"] = reason
 
                 conn.execute(
                     """
