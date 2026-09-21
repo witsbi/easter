@@ -47,26 +47,31 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def surface_kernel_rejections(fn: F) -> F:
-    """Let a Kernel rejection reach the MCP caller instead of being masked.
+    """Let a deliberate rejection reach the MCP caller instead of being masked.
 
     The MCP SDK deliberately hides an arbitrary exception's text from
     the client (it treats an unannotated exception as a server-side
-    crash, not a deliberate outcome). A KernelError is not a crash --
-    it is the Kernel deliberately and correctly rejecting an
-    operation under its own existing Authority/State semantics (e.g.
-    "authority grant has been revoked: ..."), already carrying a
-    receipt id for that rejection. Re-raising it as ToolError is the
-    one thing this adapter must do for a caller to see *why* the
-    Kernel rejected a call rather than just that something failed --
-    it changes no Kernel behavior, only how this boundary reports an
-    outcome the Kernel already produced.
+    crash, not a deliberate outcome). Neither a KernelError nor a
+    ValueError raised by this adapter's own tools is a crash:
+    - A KernelError is the Kernel deliberately and correctly
+      rejecting an operation under its own existing Authority/State
+      semantics (e.g. "authority grant has been revoked: ..."),
+      already carrying a receipt id for that rejection.
+    - A ValueError is a caller input-validation error the Kernel
+      itself raises deliberately (e.g. list_records()'s "unknown
+      record_type" check, added in v0.2) -- not an authority/state
+      semantic, but still an expected, named outcome, not a crash.
+    Re-raising either as ToolError is the one thing this adapter must
+    do for a caller to see *why* a call was rejected rather than just
+    that something failed -- it changes no Kernel behavior, only how
+    this boundary reports an outcome the Kernel already produced.
     """
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
-        except KernelError as exc:
+        except (KernelError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
     return wrapper  # type: ignore[return-value]
@@ -252,6 +257,125 @@ def revoke_all(
         reason=reason,
         evidence_ids=evidence_ids,
     )
+
+
+# ------------------------------------------------------------------
+# Observability (v0.2) -- read-only, accepted subset only. See
+# V0_2_OBSERVABILITY_DESIGN.md section 0 for what was accepted vs.
+# deferred, and V0_2_OBSERVABILITY_RECEIPT.md for implementation
+# evidence. Same rule as every tool above: thin pass-through, same
+# name/arguments/return shape as the Kernel method, zero new MCP-side
+# semantics. Pagination cursors (`after`) pass through as opaque
+# strings -- this adapter never constructs, parses, or interprets one.
+# ------------------------------------------------------------------
+
+
+@server.tool()
+def get_identity(identity_id: str) -> dict[str, Any] | None:
+    """Retrieve an Identity by identity_id, or null if it does not exist."""
+    return kernel.get_identity(identity_id)
+
+
+@server.tool()
+def get_authority(authority_id: str) -> dict[str, Any] | None:
+    """Retrieve an Authority by authority_id, or null if it does not exist."""
+    return kernel.get_authority(authority_id)
+
+
+@server.tool()
+def get_evidence(evidence_id: str) -> dict[str, Any] | None:
+    """Retrieve an Evidence record by evidence_id, or null if it does not exist."""
+    return kernel.get_evidence(evidence_id)
+
+
+@server.tool()
+def get_transition(transition_id: str) -> dict[str, Any] | None:
+    """Retrieve a Transition by transition_id, or null if it does not exist."""
+    return kernel.get_transition(transition_id)
+
+
+@server.tool()
+def get_exception_by_receipt(receipt_id: str) -> dict[str, Any] | None:
+    """Retrieve the Exception associated with a Receipt, or null if none exists.
+
+    Only REJECTED/FAILED receipts ever have one; an ACCEPTED or
+    BOOTSTRAP receipt_id returns null -- this never fabricates a
+    placeholder Exception for a receipt that never had one.
+    """
+    return kernel.get_exception_by_receipt(receipt_id)
+
+
+@server.tool()
+@surface_kernel_rejections
+def list_grants_for_identity(
+    identity_id: str,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Every Grant ever issued to this identity, oldest first, paginated.
+
+    Includes revoked and expired grants -- existence in this list is
+    not validity. Call is_grant_revoked/validate_grant separately for
+    current-validity questions. Ordering uses the kernel-enforced
+    authority sequence and is authoritative append order.
+    """
+    return kernel.list_grants_for_identity(identity_id, after=after, limit=limit)
+
+
+@server.tool()
+@surface_kernel_rejections
+def list_transitions_from_state(
+    state_id: str,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Every Transition with from_state_id = state_id, oldest first, paginated.
+
+    Multiple results mean multiple branches from this State -- all
+    are returned with no ordering that implies which is preferred.
+    For this record type, oldest-first ordering is a stable
+    created_at/transition_id walk, not authoritative commit order,
+    causality, or branch precedence.
+    """
+    return kernel.list_transitions_from_state(state_id, after=after, limit=limit)
+
+
+@server.tool()
+@surface_kernel_rejections
+def list_transitions_by_grant(
+    authority_grant_id: str,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Every Transition authorized by this grant, oldest first, paginated.
+
+    Ordering is a stable created_at/transition_id walk, not
+    authoritative commit order or causality.
+    """
+    return kernel.list_transitions_by_grant(authority_grant_id, after=after, limit=limit)
+
+
+@server.tool()
+@surface_kernel_rejections
+def list_records(
+    record_type: str,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Every record of record_type, oldest/earliest-appended first, paginated.
+
+    record_type must be one of: identity, authority, state, transition,
+    receipt, evidence, exception, grant. Each item has exactly the
+    shape the corresponding get_<type> tool would return for that id.
+    For identity, authority, state, transition, evidence, and
+    exception, oldest-first ordering is a stable created_at/primary-key
+    walk, not authoritative commit order, causality, or precedence.
+    Receipt and grant ordering uses their kernel-enforced append
+    sequences.
+    An unrecognized record_type is rejected as a tool error naming the
+    valid set, not silently accepted or crashed on.
+    """
+    return kernel.list_records(record_type, after=after, limit=limit)
 
 
 if __name__ == "__main__":

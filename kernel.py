@@ -2198,6 +2198,655 @@ class Kernel:
                 f"[receipt={receipt_id}]"
             ) from exc
 
+    # ---------------------------------------------------------
+    # OBSERVABILITY (v0.2)
+    # ---------------------------------------------------------
+    #
+    # Read-only exposure of already-authoritative facts. See
+    # V0_2_OBSERVABILITY_DESIGN.md for the full review -- this is
+    # the accepted subset only (section 0 of that document).
+    #
+    # Every method below is a pure SELECT: none opens
+    # self.transaction(), none writes, none changes any existing
+    # v0.1 validation logic. None of the existing get_state/
+    # get_receipt/get_grant/count_states/count_transitions methods
+    # above are touched -- everything here is strictly additive.
+    #
+    # None of these methods interpret opaque payload content, infer
+    # a current/canonical/preferred State or branch, or collapse
+    # ambiguity into a single answer. In particular:
+    #   - list_grants_for_identity returns every grant ever issued
+    #     to an identity, including revoked/expired ones -- existence
+    #     is not validity. A caller wanting current validity calls
+    #     is_grant_revoked()/validate_grant() separately, per
+    #     grant_id; those are distinct, existing, already-frozen
+    #     v0.1 computations this method does not fold in.
+    #   - list_transitions_from_state returns every branch from a
+    #     State with no ordering that implies preference.
+    #   - get_exception_by_receipt never fabricates a placeholder
+    #     Exception for a receipt that never had one (only
+    #     REJECTED/FAILED receipts ever do).
+    #
+    # Pagination: every list_* method (and list_records for every
+    # record_type) returns {"items": [...], "next_after": <str> |
+    # None}. limit defaults to _LIST_DEFAULT_LIMIT and is silently
+    # clamped to [1, _LIST_MAX_LIMIT] -- a resource-safety bound, not
+    # data filtering. Ordering is always ascending (oldest/earliest-
+    # appended first) -- no "most recent first" mode is offered, to
+    # avoid inviting a "give me the newest" read of any result.
+    #
+    # Two cursor kinds, and this distinction is real, not cosmetic:
+    #   - Authoritative: receipts.receipt_seq and
+    #     authority_grants.authority_seq are real, kernel-enforced,
+    #     monotonic, UNIQUE integer sequences. The cursor is that
+    #     integer (stringified). This is a true commit-order key.
+    #   - Approximate/wall-clock: identities, authorities, states,
+    #     transitions, evidence, and exceptions have no dedicated
+    #     sequence column, only created_at (a wall-clock string
+    #     computed in Python BEFORE a writer's BEGIN IMMEDIATE
+    #     acquires the write lock -- see every write method above).
+    #     The cursor for these is a compound "{created_at}|{pk}"
+    #     string. The primary-key tiebreaker guarantees pagination is
+    #     complete and duplicate-free even when two rows share a
+    #     timestamp (genuinely observed in this project's own
+    #     history), but this ordering is NOT authoritative commit
+    #     order, causality, or precedence -- only a stable, complete
+    #     pagination walk. Every caller-facing exposure of this
+    #     ordering (MCP tool descriptions, Console page copy) must
+    #     repeat this caveat, not just this comment.
+
+    _LIST_DEFAULT_LIMIT = 50
+    _LIST_MAX_LIMIT = 500
+
+    _RECORD_TYPES = frozenset(
+        {
+            "identity",
+            "authority",
+            "state",
+            "transition",
+            "receipt",
+            "evidence",
+            "exception",
+            "grant",
+        }
+    )
+
+    # record_type -> (table, primary key column, SELECT column list)
+    # for the six record types that use the compound (created_at, pk)
+    # cursor -- "receipt" and "grant" are handled separately below
+    # since they have their own authoritative sequence columns.
+    _COMPOUND_CURSOR_TABLES = {
+        "identity": ("identities", "identity_id", "identity_id, created_at, payload"),
+        "authority": ("authorities", "authority_id", "authority_id, created_at, is_root, payload"),
+        "state": ("states", "state_id", "state_id, created_at, payload"),
+        "transition": (
+            "transitions",
+            "transition_id",
+            "transition_id, from_state_id, to_state_id, authority_grant_id, created_at, payload",
+        ),
+        "evidence": ("evidence", "evidence_id", "evidence_id, created_at, payload"),
+        "exception": ("exceptions", "exception_id", "exception_id, receipt_id, created_at, payload"),
+    }
+
+    @classmethod
+    def _clamp_limit(cls, limit: int) -> int:
+        return max(1, min(int(limit), cls._LIST_MAX_LIMIT))
+
+    @staticmethod
+    def _encode_compound_cursor(created_at: str, pk: str) -> str:
+        return f"{created_at}|{pk}"
+
+    @staticmethod
+    def _decode_compound_cursor(cursor: str) -> tuple[str, str]:
+        created_at, pk = cursor.split("|", 1)
+        return created_at, pk
+
+    @staticmethod
+    def _transition_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "transition_id": row["transition_id"],
+            "from_state_id": row["from_state_id"],
+            "to_state_id": row["to_state_id"],
+            "authority_grant_id": row["authority_grant_id"],
+            "created_at": row["created_at"],
+            "payload": json.loads(row["payload"]),
+        }
+
+    @staticmethod
+    def _row_to_dict_for_record_type(
+        record_type: str, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        if record_type == "identity":
+            return {
+                "identity_id": row["identity_id"],
+                "created_at": row["created_at"],
+                "payload": json.loads(row["payload"]),
+            }
+        if record_type == "authority":
+            return {
+                "authority_id": row["authority_id"],
+                "created_at": row["created_at"],
+                "is_root": bool(row["is_root"]),
+                "payload": json.loads(row["payload"]),
+            }
+        if record_type == "state":
+            return {
+                "state_id": row["state_id"],
+                "created_at": row["created_at"],
+                "payload": json.loads(row["payload"]),
+            }
+        if record_type == "transition":
+            return Kernel._transition_row_to_dict(row)
+        if record_type == "evidence":
+            return {
+                "evidence_id": row["evidence_id"],
+                "created_at": row["created_at"],
+                "payload": json.loads(row["payload"]),
+            }
+        if record_type == "exception":
+            return {
+                "exception_id": row["exception_id"],
+                "receipt_id": row["receipt_id"],
+                "created_at": row["created_at"],
+                "payload": json.loads(row["payload"]),
+            }
+        raise ValueError(f"unsupported compound-cursor record_type: {record_type!r}")
+
+    # -----------------------------------------------------
+    # New single-record getters: get_identity, get_authority,
+    # get_evidence, get_transition, get_exception_by_receipt.
+    #
+    # Each mirrors get_state/get_receipt/get_grant above exactly:
+    # a plain WHERE <pk> = ? lookup, returning the full row as a
+    # dict with payload JSON-decoded, or None if absent. Existence
+    # is answered by `result is not None` -- no separate boolean
+    # "exists" method is added, matching the established convention
+    # (see get_state/get_receipt/get_grant, and Console-0's own
+    # tests, which already depend on unknown ids returning null).
+    # -----------------------------------------------------
+
+    def get_identity(self, identity_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT identity_id, created_at, payload
+                FROM identities
+                WHERE identity_id = ?
+                """,
+                (identity_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "identity_id": row["identity_id"],
+            "created_at": row["created_at"],
+            "payload": json.loads(row["payload"]),
+        }
+
+    def get_authority(self, authority_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT authority_id, created_at, is_root, payload
+                FROM authorities
+                WHERE authority_id = ?
+                """,
+                (authority_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "authority_id": row["authority_id"],
+            "created_at": row["created_at"],
+            "is_root": bool(row["is_root"]),
+            "payload": json.loads(row["payload"]),
+        }
+
+    def get_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT evidence_id, created_at, payload
+                FROM evidence
+                WHERE evidence_id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "evidence_id": row["evidence_id"],
+            "created_at": row["created_at"],
+            "payload": json.loads(row["payload"]),
+        }
+
+    def get_transition(self, transition_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    transition_id,
+                    from_state_id,
+                    to_state_id,
+                    authority_grant_id,
+                    created_at,
+                    payload
+                FROM transitions
+                WHERE transition_id = ?
+                """,
+                (transition_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return self._transition_row_to_dict(row)
+
+    def get_exception_by_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        """
+        The Exception record (diagnostic detail) associated with a
+        given Receipt, if one exists. exceptions.receipt_id is
+        UNIQUE, so this is a clean 1:1 lookup.
+
+        Only REJECTED/FAILED receipts ever have an associated
+        Exception (see record_failure(), which unconditionally
+        inserts one for both outcomes) -- an ACCEPTED or BOOTSTRAP
+        receipt_id returns None here. This method never fabricates a
+        placeholder Exception for a receipt that never had one.
+
+        Deliberately receipt-oriented, not exception_id-oriented: no
+        existing operation ever returns an exception_id to a caller
+        (record_failure() generates it internally and never surfaces
+        it), so a get_exception(exception_id) lookup would require a
+        key no real caller can ever hold. receipt_id is what every
+        REJECTED/FAILED caller already has -- it is returned (inside
+        the "[receipt=...]" suffix) on every KernelError raised by
+        grant/revoke/revoke_all/define_authority/record_evidence/
+        transition.
+
+        payload is returned exactly as record_failure() wrote it --
+        {"reason", "details", "unlinkable_evidence_ids"?} -- never
+        reinterpreted. `details` is diagnostic content the Exception
+        itself carries, not verified or asserted true by the kernel,
+        the same category of disclaimer record_evidence() already
+        makes about Evidence content.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT exception_id, receipt_id, created_at, payload
+                FROM exceptions
+                WHERE receipt_id = ?
+                """,
+                (receipt_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return {
+            "exception_id": row["exception_id"],
+            "receipt_id": row["receipt_id"],
+            "created_at": row["created_at"],
+            "payload": json.loads(row["payload"]),
+        }
+
+    # -----------------------------------------------------
+    # New relationship queries: list_grants_for_identity,
+    # list_transitions_from_state, list_transitions_by_grant.
+    # -----------------------------------------------------
+
+    def list_grants_for_identity(
+        self,
+        identity_id: str,
+        after: str | None = None,
+        limit: int = _LIST_DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
+        """
+        Every grant ever issued to this identity, ordered by
+        authority_seq (Authority's own authoritative append-order
+        sequence, real/UNIQUE/kernel-enforced) ascending -- oldest-
+        issued first, never "most recent first".
+
+        Returns EVERY grant this identity has ever held, including
+        revoked and expired ones -- this method does not filter by
+        current validity. Existence in this list is not validity. A
+        caller wanting to know whether a specific grant_id is
+        currently valid must call is_grant_revoked()/validate_grant()
+        for that grant_id separately; those are distinct, existing,
+        already-frozen v0.1 computations this method does not fold
+        in.
+
+        Each item has exactly the shape get_grant() returns.
+        """
+        limit = self._clamp_limit(limit)
+        after_seq = int(after) if after is not None else -1
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    grant_id,
+                    authority_seq,
+                    identity_id,
+                    authority_id,
+                    granted_by_identity_id,
+                    created_at,
+                    valid_from,
+                    expires_at,
+                    payload
+                FROM authority_grants
+                WHERE identity_id = ?
+                  AND authority_seq > ?
+                ORDER BY authority_seq ASC
+                LIMIT ?
+                """,
+                (identity_id, after_seq, limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+
+        items = [
+            {
+                "grant_id": row["grant_id"],
+                "authority_seq": row["authority_seq"],
+                "identity_id": row["identity_id"],
+                "authority_id": row["authority_id"],
+                "granted_by_identity_id": row["granted_by_identity_id"],
+                "created_at": row["created_at"],
+                "valid_from": row["valid_from"],
+                "expires_at": row["expires_at"],
+                "payload": json.loads(row["payload"]),
+            }
+            for row in page_rows
+        ]
+
+        next_after = str(page_rows[-1]["authority_seq"]) if has_more else None
+
+        return {"items": items, "next_after": next_after}
+
+    def list_transitions_from_state(
+        self,
+        state_id: str,
+        after: str | None = None,
+        limit: int = _LIST_DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
+        """
+        Every transition with from_state_id = state_id -- zero, one,
+        or many. Multiple results mean multiple branches from this
+        State; this method returns all of them with no ordering that
+        implies which is preferred (see the module-level pagination
+        comment above for why (created_at, transition_id) ordering
+        is wall-clock-approximate, not authoritative, and must never
+        be read as precedence between branches).
+
+        Each item has exactly the shape get_transition() returns.
+        """
+        limit = self._clamp_limit(limit)
+        after_created_at, after_id = (
+            self._decode_compound_cursor(after) if after is not None else ("", "")
+        )
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    transition_id,
+                    from_state_id,
+                    to_state_id,
+                    authority_grant_id,
+                    created_at,
+                    payload
+                FROM transitions
+                WHERE from_state_id = ?
+                  AND (created_at, transition_id) > (?, ?)
+                ORDER BY created_at ASC, transition_id ASC
+                LIMIT ?
+                """,
+                (state_id, after_created_at, after_id, limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        items = [self._transition_row_to_dict(row) for row in page_rows]
+        next_after = (
+            self._encode_compound_cursor(
+                page_rows[-1]["created_at"], page_rows[-1]["transition_id"]
+            )
+            if has_more
+            else None
+        )
+
+        return {"items": items, "next_after": next_after}
+
+    def list_transitions_by_grant(
+        self,
+        authority_grant_id: str,
+        after: str | None = None,
+        limit: int = _LIST_DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
+        """
+        Every transition with authority_grant_id = authority_grant_id
+        -- every State transition this specific grant has ever
+        authorized. Same ordering caveats as
+        list_transitions_from_state: (created_at, transition_id) is
+        wall-clock-approximate, not authoritative.
+
+        Each item has exactly the shape get_transition() returns.
+        """
+        limit = self._clamp_limit(limit)
+        after_created_at, after_id = (
+            self._decode_compound_cursor(after) if after is not None else ("", "")
+        )
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    transition_id,
+                    from_state_id,
+                    to_state_id,
+                    authority_grant_id,
+                    created_at,
+                    payload
+                FROM transitions
+                WHERE authority_grant_id = ?
+                  AND (created_at, transition_id) > (?, ?)
+                ORDER BY created_at ASC, transition_id ASC
+                LIMIT ?
+                """,
+                (authority_grant_id, after_created_at, after_id, limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        items = [self._transition_row_to_dict(row) for row in page_rows]
+        next_after = (
+            self._encode_compound_cursor(
+                page_rows[-1]["created_at"], page_rows[-1]["transition_id"]
+            )
+            if has_more
+            else None
+        )
+
+        return {"items": items, "next_after": next_after}
+
+    # -----------------------------------------------------
+    # list_records: the one generic enumeration primitive (see
+    # V0_2_OBSERVABILITY_DESIGN.md section 3.3 for why genericity is
+    # used here and nowhere else in this file -- full-table
+    # enumeration is structurally uniform across all eight primitive
+    # tables; single lookups and relationship queries are not).
+    # -----------------------------------------------------
+
+    def list_records(
+        self,
+        record_type: str,
+        after: str | None = None,
+        limit: int = _LIST_DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
+        """
+        Every record of record_type, oldest/earliest-appended first,
+        paginated. record_type must be one of: identity, authority,
+        state, transition, receipt, evidence, exception, grant.
+
+        Each returned item has exactly the same shape the
+        corresponding get_<type> method would return for that id --
+        e.g. list_records("state", ...) items are exactly what
+        get_state(that_id) returns.
+
+        No ninth "revocation" record_type is offered -- no DOGFOOD-0
+        question asked for one, and this stays the smallest surface
+        that answers the ones that were asked (see
+        V0_2_OBSERVABILITY_DESIGN.md section 3.3).
+
+        Raises ValueError for an unrecognized record_type -- this is
+        a caller input error, not a Kernel authority/state semantic,
+        so it is not a KernelError.
+        """
+        if record_type not in self._RECORD_TYPES:
+            raise ValueError(
+                f"unknown record_type: {record_type!r} -- must be one "
+                f"of {sorted(self._RECORD_TYPES)}"
+            )
+
+        limit = self._clamp_limit(limit)
+
+        if record_type == "receipt":
+            return self._list_records_receipts(after, limit)
+
+        if record_type == "grant":
+            return self._list_records_grants(after, limit)
+
+        return self._list_records_compound_cursor(record_type, after, limit)
+
+    def _list_records_receipts(self, after: str | None, limit: int) -> dict[str, Any]:
+        after_seq = int(after) if after is not None else -1
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    receipt_seq,
+                    receipt_id,
+                    operation_id,
+                    transition_id,
+                    outcome,
+                    created_at,
+                    payload
+                FROM receipts
+                WHERE receipt_seq > ?
+                ORDER BY receipt_seq ASC
+                LIMIT ?
+                """,
+                (after_seq, limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+
+        items = [
+            {
+                "receipt_id": row["receipt_id"],
+                "operation_id": row["operation_id"],
+                "transition_id": row["transition_id"],
+                "outcome": row["outcome"],
+                "created_at": row["created_at"],
+                "payload": json.loads(row["payload"]),
+            }
+            for row in page_rows
+        ]
+
+        next_after = str(page_rows[-1]["receipt_seq"]) if has_more else None
+
+        return {"items": items, "next_after": next_after}
+
+    def _list_records_grants(self, after: str | None, limit: int) -> dict[str, Any]:
+        after_seq = int(after) if after is not None else -1
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    grant_id,
+                    authority_seq,
+                    identity_id,
+                    authority_id,
+                    granted_by_identity_id,
+                    created_at,
+                    valid_from,
+                    expires_at,
+                    payload
+                FROM authority_grants
+                WHERE authority_seq > ?
+                ORDER BY authority_seq ASC
+                LIMIT ?
+                """,
+                (after_seq, limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+
+        items = [
+            {
+                "grant_id": row["grant_id"],
+                "authority_seq": row["authority_seq"],
+                "identity_id": row["identity_id"],
+                "authority_id": row["authority_id"],
+                "granted_by_identity_id": row["granted_by_identity_id"],
+                "created_at": row["created_at"],
+                "valid_from": row["valid_from"],
+                "expires_at": row["expires_at"],
+                "payload": json.loads(row["payload"]),
+            }
+            for row in page_rows
+        ]
+
+        next_after = str(page_rows[-1]["authority_seq"]) if has_more else None
+
+        return {"items": items, "next_after": next_after}
+
+    def _list_records_compound_cursor(
+        self, record_type: str, after: str | None, limit: int
+    ) -> dict[str, Any]:
+        table, pk, columns_sql = self._COMPOUND_CURSOR_TABLES[record_type]
+        after_created_at, after_pk = (
+            self._decode_compound_cursor(after) if after is not None else ("", "")
+        )
+
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {columns_sql}
+                FROM {table}
+                WHERE (created_at, {pk}) > (?, ?)
+                ORDER BY created_at ASC, {pk} ASC
+                LIMIT ?
+                """,
+                (after_created_at, after_pk, limit + 1),
+            ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        items = [
+            self._row_to_dict_for_record_type(record_type, row) for row in page_rows
+        ]
+        next_after = (
+            self._encode_compound_cursor(page_rows[-1]["created_at"], page_rows[-1][pk])
+            if has_more
+            else None
+        )
+
+        return {"items": items, "next_after": next_after}
+
 # -------------------------------------------------------------
 # Minimal command-line smoke test
 # -------------------------------------------------------------
