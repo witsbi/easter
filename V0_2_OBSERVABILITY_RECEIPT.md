@@ -56,7 +56,12 @@ No Console surface was added for v0.2.
 - Pagination is bounded to 1..500, ascending only, and returns every record.
   Receipt/grant cursors use kernel-enforced sequences; other cursors use a
   stable `created_at|primary_key` walk explicitly documented as non-
-  authoritative commit order.
+  authoritative commit order. Python `isoformat()` may omit the fractional
+  component when microseconds are exactly zero, which is an additional,
+  extremely rare reason lexicographic `created_at` ordering must not be
+  interpreted as authoritative chronology. Filtering and ordering use the
+  same stored representation, so pagination remains internally consistent
+  and exhaustive.
 - No deferred API was smuggled into a generic dispatcher.
 
 ## 4. Executed evidence
@@ -80,6 +85,9 @@ All commands below were run with the repository `.venv` and exited 0:
   - All nine tools reached the real Kernel.
   - Failed operation Exception retrieved through MCP.
   - `None` getters verified through the `content=[]` contract.
+  - Invalid `record_type` verified as a named v0.2 tool error at the
+    `list_records` boundary; the shared frozen v0.1 rejection decorator
+    remains `KernelError`-only.
 - Relevant Kernel regressions: `authority_2`, `authority_3`, `receipt_1`,
   `receipt_2`, `exception_1`, `whole_kernel_long_history`,
   `whole_kernel_part_c`, and `whole_kernel_concurrency`: PASS.
@@ -108,4 +116,3 @@ The v0.2 tests themselves use throwaway database copies and passed.
 `git diff main -- schema.sql` is empty. No schema file was changed.
 
 The implementation and tests are ready for review; no merge was performed.
-

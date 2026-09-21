@@ -51,18 +51,13 @@ def surface_kernel_rejections(fn: F) -> F:
 
     The MCP SDK deliberately hides an arbitrary exception's text from
     the client (it treats an unannotated exception as a server-side
-    crash, not a deliberate outcome). Neither a KernelError nor a
-    ValueError raised by this adapter's own tools is a crash:
+    crash, not a deliberate outcome). A KernelError is not a crash:
     - A KernelError is the Kernel deliberately and correctly
       rejecting an operation under its own existing Authority/State
       semantics (e.g. "authority grant has been revoked: ..."),
       already carrying a receipt id for that rejection.
-    - A ValueError is a caller input-validation error the Kernel
-      itself raises deliberately (e.g. list_records()'s "unknown
-      record_type" check, added in v0.2) -- not an authority/state
-      semantic, but still an expected, named outcome, not a crash.
-    Re-raising either as ToolError is the one thing this adapter must
-    do for a caller to see *why* a call was rejected rather than just
+    Re-raising it as ToolError is the one thing this adapter must do
+    for a caller to see *why* a call was rejected rather than just
     that something failed -- it changes no Kernel behavior, only how
     this boundary reports an outcome the Kernel already produced.
     """
@@ -71,7 +66,7 @@ def surface_kernel_rejections(fn: F) -> F:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
-        except (KernelError, ValueError) as exc:
+        except KernelError as exc:
             raise ToolError(str(exc)) from exc
 
     return wrapper  # type: ignore[return-value]
@@ -375,7 +370,13 @@ def list_records(
     An unrecognized record_type is rejected as a tool error naming the
     valid set, not silently accepted or crashed on.
     """
-    return kernel.list_records(record_type, after=after, limit=limit)
+    try:
+        return kernel.list_records(record_type, after=after, limit=limit)
+    except ValueError as exc:
+        # This is the intentional v0.2 input-validation boundary. Keep
+        # it local so the frozen v0.1 write-tool decorator above remains
+        # KernelError-only.
+        raise ToolError(str(exc)) from exc
 
 
 if __name__ == "__main__":
