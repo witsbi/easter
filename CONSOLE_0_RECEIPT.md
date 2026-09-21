@@ -173,6 +173,46 @@ all, only "what is this specific id." Not implemented here.
 **None.** `git diff main -- kernel.py schema.sql` is empty. `console.py`
 never imports `kernel.py`.
 
+## Addendum: PR #13 review fixes
+
+PR review on this work found two issues, both fixed on the same
+branch without touching `kernel.py`/`schema.sql`:
+
+1. **Typed confirmation is not a security boundary.** The re-type
+   confirmation on `revoke`/`revoke_all` guards against an operator's
+   own mistake — it does nothing to stop a malicious cross-origin page
+   from submitting a matching hidden form to the Console on the
+   operator's behalf (the attacker's page can just fill in the same
+   value twice). Fixed with two independent, additive changes, both
+   entirely in `console.py`:
+   - **Loopback-only, enforced, not just defaulted.** `CONSOLE_HOST`
+     already defaulted to `127.0.0.1`, but any value was previously
+     accepted. Startup now refuses to bind to anything outside
+     `{127.0.0.1, localhost, ::1}` with a clear error, since there is
+     no authentication or remote-access security design yet.
+   - **Origin/Referer check on every authority-changing POST**
+     (`reject_cross_origin`, applied to `define_authority_submit`,
+     `grant_issue_submit`, `grant_revoke_submit`, `revoke_all_submit`).
+     A request whose `Origin` (or, when absent, `Referer`) header does
+     not match the Console's own loopback origin is rejected with 403
+     *before* any MCP call — verified in `console_0_5_csrf_origin_protection.py`
+     by taking a direct sqlite table count immediately before and
+     after each cross-origin attempt on all four routes and asserting
+     it is unchanged. A request with neither header (first-party
+     tooling: curl, this repo's own test scripts) is treated as
+     legitimate, since real browsers reliably attach `Origin` to
+     cross-origin state-changing requests. No authentication semantics
+     were added anywhere, and none live in the Kernel.
+2. **Malformed JSON in the free-text `payload` field crashed with a
+   bare HTTP 500.** `define_authority_submit` now catches
+   `json.JSONDecodeError` and re-renders the form with an actionable
+   400 error instead of letting it propagate — fixed and covered by
+   `console_0_6_malformed_json_payload.py`.
+
+All six Console-0 tests (four original plus these two) and all three
+MCP-0 tests were rerun after the fix; all pass. `git diff main --
+kernel.py schema.sql` remains empty.
+
 ## Stop condition
 
 All seven numbered verification points plus the destructive-action

@@ -36,7 +36,24 @@ records the exact unanswerable question -- see CONSOLE_0_RECEIPT.md.
 Destructive/authority-changing actions (revoke, revoke_all) require
 the operator to re-type the exact target id into a confirmation field.
 A mismatch is rejected by the Console before any MCP call is made --
-this is a userland safety gate, not a Kernel rule.
+this is a deliberate-action UX gate against operator mistakes, not
+authentication or CSRF protection.
+
+Security model (kept deliberately minimal and local, per PR #13
+review -- no authentication semantics are invented anywhere, and
+none live in the Kernel):
+    - The Console is constrained to loopback-only operation
+      (127.0.0.1/localhost/::1). There is no remote-access security
+      design yet, so binding elsewhere is refused outright at
+      startup rather than silently allowed.
+    - Every authority-changing POST (define/grant/revoke/revoke_all)
+      is rejected before MCP is ever called if its Origin (or, when
+      Origin is absent, Referer) header does not match the Console's
+      own loopback origin -- see reject_cross_origin(). This is what
+      actually stops a malicious cross-origin page from submitting a
+      hidden form to localhost on the operator's behalf; the typed
+      confirmation above is a separate, additional safety gate for a
+      human who *is* legitimately using the Console.
 """
 
 from __future__ import annotations
@@ -60,6 +77,8 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 HERE = Path(__file__).parent
 MCP_SERVER_PATH = HERE / "mcp_server.py"
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
 # ------------------------------------------------------------------
@@ -119,7 +138,7 @@ mcp_client = ConsoleMCPClient(os.environ.get("KERNEL_DB_PATH"))
 # ------------------------------------------------------------------
 
 
-def page(title: str, body: str) -> HTMLResponse:
+def page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
     return HTMLResponse(
         f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>EASTER Console -- {html.escape(title)}</title>
@@ -148,8 +167,66 @@ pre {{ background: #f0f0f0; padding: 1rem; overflow-x: auto; white-space: pre-wr
 </nav>
 <h2>{html.escape(title)}</h2>
 {body}
-</body></html>"""
+</body></html>""",
+        status_code=status_code,
     )
+
+
+def _allowed_origins(request: Request) -> set[str]:
+    """This Console's own loopback origin(s), for the port actually in use."""
+    port = request.url.port
+    scheme = request.url.scheme
+    return {f"{scheme}://{host}:{port}" for host in LOOPBACK_HOSTS}
+
+
+def reject_cross_origin(request: Request) -> HTMLResponse | None:
+    """CSRF/cross-origin guard for authority-changing POSTs.
+
+    The typed re-confirmation fields on revoke/revoke_all are a
+    deliberate-action UX gate against operator mistakes -- they do
+    nothing to stop a malicious cross-origin page from submitting a
+    matching hidden form to this Console on the operator's behalf,
+    since the attacker's page can simply fill in the same value twice.
+    This is a separate, additional check, applied to every
+    authority-changing POST (define/grant/revoke/revoke_all), not just
+    the two with typed confirmation.
+
+    Returns a 403 HTMLResponse to send back immediately -- *before*
+    any MCP call is made -- if the request's Origin (or, when Origin
+    is absent, Referer) header does not match this Console's own
+    loopback origin. Returns None if the request should proceed.
+
+    A request with neither Origin nor Referer at all is treated as
+    first-party tooling (curl, direct API scripts, this repo's own
+    test scripts) rather than a browser-driven cross-origin attack:
+    real browsers reliably attach Origin to state-changing
+    cross-origin requests, so its complete absence is not the attack
+    this check exists to stop.
+    """
+    origin = request.headers.get("origin")
+    referer = request.headers.get("referer")
+    allowed = _allowed_origins(request)
+
+    if origin is not None and origin not in allowed:
+        return page(
+            "Rejected -- cross-origin request",
+            f'<p class="error">Rejected before contacting MCP: Origin '
+            f"{html.escape(origin)} does not match this Console's own loopback "
+            "origin. This looks like a cross-origin request, not a same-origin "
+            "form submission from this Console.</p>",
+            status_code=403,
+        )
+
+    if origin is None and referer is not None and not any(referer.startswith(o) for o in allowed):
+        return page(
+            "Rejected -- cross-origin request",
+            f'<p class="error">Rejected before contacting MCP: Referer '
+            f"{html.escape(referer)} does not match this Console's own loopback "
+            "origin.</p>",
+            status_code=403,
+        )
+
+    return None
 
 
 def result_block(is_error: bool, payload: Any) -> str:
@@ -304,9 +381,24 @@ async def define_authority_view(request: Request) -> HTMLResponse:
 
 
 async def define_authority_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
     form = await request.form()
     payload_raw = (form.get("payload") or "").strip()
-    payload = json.loads(payload_raw) if payload_raw else None
+    payload: dict[str, Any] | None = None
+    if payload_raw:
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError as exc:
+            body = (
+                DEFINE_AUTHORITY_FORM
+                + f'<p class="error">Invalid JSON in payload field: {html.escape(str(exc))}. '
+                "Nothing was sent to MCP -- fix the payload and resubmit.</p>"
+            )
+            return page("Define Authority -- invalid input", body, status_code=400)
+
     is_error, result = await mcp_client.call(
         "define_authority",
         {
@@ -325,6 +417,10 @@ async def grant_issue_view(request: Request) -> HTMLResponse:
 
 
 async def grant_issue_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
     form = await request.form()
     is_error, result = await mcp_client.call(
         "grant",
@@ -343,6 +439,10 @@ async def grant_revoke_view(request: Request) -> HTMLResponse:
 
 
 async def grant_revoke_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
     form = await request.form()
     grant_id = (form.get("grant_id") or "").strip()
     confirm = (form.get("confirm_grant_id") or "").strip()
@@ -373,6 +473,10 @@ async def revoke_all_view(request: Request) -> HTMLResponse:
 
 
 async def revoke_all_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
     form = await request.form()
     identity_id = (form.get("identity_id") or "").strip()
     confirm = (form.get("confirm_identity_id") or "").strip()
@@ -429,5 +533,12 @@ app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
     host = os.environ.get("CONSOLE_HOST", "127.0.0.1")
+    if host not in LOOPBACK_HOSTS:
+        raise SystemExit(
+            f"CONSOLE_HOST={host!r} rejected: EASTER-CONSOLE-0 has no "
+            "authentication or remote-access security design yet, so it is "
+            f"constrained to loopback only ({sorted(LOOPBACK_HOSTS)}). Design "
+            "remote-access security before binding elsewhere."
+        )
     port = int(os.environ.get("CONSOLE_PORT", "8420"))
     uvicorn.run(app, host=host, port=port, log_level="info")
