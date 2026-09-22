@@ -22,7 +22,8 @@ from pathlib import Path
 import kernel as kernel_module
 from kernel import Kernel, KernelError
 
-REPO = Path(__file__).parent
+REPO = Path(__file__).resolve().parent.parent
+GENESIS_SEED = Path(__file__).resolve().parent / "fixtures" / "genesis_seed.sql"
 NATHAN = "identity:nathan"
 ROOT_GRANT = "grant:genesis-root"
 GENESIS = "state:genesis"
@@ -33,7 +34,7 @@ def fresh_kernel() -> Kernel:
     f.close()
     db_path = Path(f.name)
     subprocess.run(["sqlite3", str(db_path)], stdin=open(REPO / "schema.sql"), check=True)
-    subprocess.run(["sqlite3", str(db_path)], stdin=open(REPO / "genesis_seed.sql"), check=True)
+    subprocess.run(["sqlite3", str(db_path)], stdin=open(GENESIS_SEED), check=True)
     return Kernel(db_path)
 
 

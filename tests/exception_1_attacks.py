@@ -35,7 +35,7 @@ def counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
 
 
-source = Path(__file__).parent / "data" / "kernel.db"
+source = Path(__file__).resolve().parent.parent / "data" / "kernel.db"
 with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as f:
     f.close()
     db_path = Path(f.name)

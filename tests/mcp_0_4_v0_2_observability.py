@@ -23,7 +23,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from kernel import Kernel
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 ROOT = "grant:genesis-root"
 NATHAN = "identity:nathan"
 GENESIS = "state:genesis"

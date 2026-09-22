@@ -17,7 +17,7 @@ from pathlib import Path
 
 from kernel import Kernel, KernelError
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 ROOT = "grant:genesis-root"
 NATHAN = "identity:nathan"
 GENESIS = "state:genesis"

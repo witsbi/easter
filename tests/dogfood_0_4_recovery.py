@@ -36,7 +36,7 @@ from pathlib import Path
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 
 # The only reason this "new session" can recover anything: it was
 # told this id out-of-band (here, copied from dogfood_0_3's printed

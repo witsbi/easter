@@ -22,7 +22,7 @@ CLAWDE = "identity:clawde"
 AUTHORITY = "authority:clawde-scope-alpha"
 
 
-source = Path(__file__).parent / "data" / "kernel.db"
+source = Path(__file__).resolve().parent.parent / "data" / "kernel.db"
 with tempfile.NamedTemporaryFile(prefix="receipt-remediation-", suffix=".db") as f:
     f.close()
     db_path = Path(f.name)
