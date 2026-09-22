@@ -1,180 +1,203 @@
-# Intelligence Kernel
+# EASTER
 
-An experimental attempt to identify the minimum primitives required for persistent, governed intelligence across interchangeable cognitive substrates.
+**A small deterministic kernel for persistent, governed state across interchangeable AI runtimes.**
 
-This repository begins with a frozen architecture hypothesis. **v0.1 should be attacked rather than extended.** A semantic change or new primitive requires a counterexample that cannot be naturally represented by the frozen kernel.
+EASTER preserves authoritative history independently of the model, agent, process, or conversation currently doing the work.
 
-## Intelligence Kernel v0.1 — FROZEN 2026-09-18
+The core idea is simple:
 
-### Five candidate primitives
+> **The intelligence is replaceable. The authoritative history is not.**
 
-**STATE** — the authoritative representation currently accepted by the system. State is not necessarily objective truth; it must remain corrigible.
+An AI runtime can disappear. A session can end. A model can change. Another runtime can continue from the durable record without requiring the original intelligence to survive.
 
-**IDENTITY** — persistent addressability across transformations. Identity is distinct from persona, model, process, or behavioral policy. It provides a durable referent for relationships, authority, commitments, and provenance.
+EASTER provides a small substrate for doing that while keeping authority explicit and history append-only.
 
-**AUTHORITY** — governance over which identities may propose, accept, cause, delegate, revoke, inherit, or otherwise govern particular state transitions. Authority may originate outside the kernel. The kernel represents and enforces authority; it is not necessarily the ultimate source of authority.
+## The Six Primitives
 
-**CAPABILITY** — the available means by which transformations can actually be performed. Humans, models, tools, code, councils, and other cognitive resources can supply capabilities without becoming kernel primitives themselves.
+EASTER is named for its six kernel primitives:
 
-**PROVENANCE** — the justification and lineage of a transition: where it came from, what supports it, and enough linkage to reconstruct meaningful ancestry and correction.
+**E — Evidence**<br>
+Immutable opaque information admitted into the historical record. Evidence may support later operations, but its presence does not establish truth, authenticity, relevance, or sufficiency.
 
-### Fundamental graph grammar
+**A — Authority**<br>
+Defines who may authorize operations. Authority and State have independent lifecycles. Root authority governs Authority administration; valid grants authorize permitted kernel operations.
 
-```text
-S₀ ──[ Identity · Authority · Capability · Provenance ]──▶ S₁
-```
+**S — State**<br>
+An immutable opaque JSON snapshot admitted through an accepted Transition. State records what was accepted, not necessarily what is objectively true.
 
-State forms the nodes. Identity, Authority, Capability, and Provenance characterize meaningful transition edges.
+**T — Transition**<br>
+Connects one existing State to one newly created State. Transitions create lineage. Branching is valid and expected.
 
-## Core hypothesis
+**E — Exception**<br>
+Immutable kernel-recorded diagnostic information describing an operation that failed to complete normally.
 
-> The durable object is not the intelligence performing the cognition. The durable object is the authoritative state and provenance of its transitions.
+**R — Receipt**<br>
+An immutable kernel-authored record of an operation's outcome. An `ACCEPTED` Receipt means the operation was admitted and its authoritative effects committed atomically. It does not mean the resulting State or Evidence is true or correct.
 
-Intelligence can therefore be replaceable compute operating against a persistent substrate.
+Together they form **EASTER**.
 
-A persistent working identity may likewise be implemented independently of the cognitive resource currently participating. A model, process, conversation, or runtime can disappear while the substrate remains available for another capability to continue from authoritative state.
+## What the Kernel Does
 
-## What is not currently primitive
+EASTER owns a small set of mechanics:
 
-The following currently appear derivable or implementable using the five frozen primitives:
+* append-only authoritative history
+* immutable State
+* explicit State transitions
+* Authority and grants
+* revocation
+* Evidence admission and citation
+* atomic operation outcomes
+* Receipts
+* failure diagnostics
+* durable lineage
 
-- agent
-- model
-- persona
-- prompt
-- conversation
-- generic memory
-- task
-- goal
-- context window
-- tool
-- workflow
-- checkpoint
-- steward
-- council
-- continuity
-- branching
-- promotion
-- supersession
-- delegation
-- succession
-- lineage
+The kernel deliberately does **not** decide application meaning.
 
-This list is a hypothesis, not a claim that these concepts are unimportant. They may be essential userland structures while remaining unnecessary as kernel primitives.
+It does not determine:
 
-## Initial adversarial tests
+* the current State
+* the canonical State
+* the preferred branch
+* whether Evidence is true
+* whether a State is correct
+* what an agent should do next
+* what a payload means
+* which model or runtime should perform cognition
 
-v0.1 has so far been tested conceptually against:
+Those decisions belong to userland.
 
-- novel creation without a predetermined target state
-- ambiguous intent
-- conflicting valid authorities
-- incorrect authoritative beliefs
-- epistemic correction
-- introduction of new evidence-producing capabilities
-- self-modification of kernel semantics
-- external authority
-- delegation and revocation
-- inheritance and human succession
+## Architecture
 
-### Novel creation
-
-Creation can be represented as authorized generation of candidate state branches linked by provenance to prior state, followed by an authorized acceptance or rejection transition. A predetermined final state is not required.
-
-### Conflicting authority
-
-Conflicting valid transitions may remain unresolved. The kernel does not need to guarantee progress. Resolution can require an identity possessing authority over the conflict.
-
-### Epistemic correction
-
-State represents what is authoritatively accepted, not guaranteed objective truth. New evidence can justify an explicit superseding transition without rewriting the history of why the prior state was accepted.
-
-### Kernel self-modification
-
-A kernel transition can itself be represented as a governed branch:
+At its simplest:
 
 ```text
-K₀ ──[ Identity · Authority · Capability · Provenance ]──▶ K₁
+State A
+   │
+   │ authorized Transition
+   ▼
+State B
 ```
 
-The kernel is not assumed to be the ultimate source of authority. An originating authority can authorize migration from K₀ to a candidate K₁ while preserving the lineage of the change.
-
-### Authority succession
-
-Authority can move between persistent identities without collapsing those identities:
+A State may have multiple outgoing Transitions:
 
 ```text
-Authority(I₀, X) ──[ succession event + provenance ]──▶ Authority(I₁, X)
+             ┌──▶ State B
+             │
+State A ─────┤
+             │
+             └──▶ State C
 ```
 
-Inheritance, organizational succession, delegated AI permissions, revocation, and external authority may therefore be different graph shapes expressed by the same grammar.
+Both branches remain valid history.
 
-## Discovery lineage
+EASTER does not silently choose one as canonical or current.
 
-v0.1 emerged through subtraction rather than feature design.
+Userland decides which branch to continue.
 
-Two earlier architecture lines were treated as fossil records:
+## Authority
 
-**Cognitive OS / SynthForge** explored a control plane above intelligence: explicit promotion, bounded authority, lineage, branch/evaluate/promote behavior, and separation of accepted intent from permission to cause consequential effects.
+State answers:
 
-**Threads** explored continuity above individual runtimes: durable state, structured decisions, epistemic provenance, checkpoints, explicit supersession rather than silent overwrite, and recovery independent of the intelligence that originally produced the state.
+> What was recorded?
 
-Later work with heterogeneous local and remote intelligence, capability/tool discovery, model succession, recovery, councils, routing, and state rehydration independently rediscovered several of the same pressures.
+Authority answers:
 
-The fossil architectures are evidence sources, not ancestors that v0.1 must preserve. Implementation-specific concepts were deliberately discarded when they did not survive comparison.
+> Who may append what happens next?
 
-## Method
+The two are intentionally separate.
 
-The kernel emerged by attempting to delete candidate primitives.
+Authority administration is performed through explicit kernel operations. Grants are append-only records, and revocation affects future use without rewriting historical operations that were valid when they occurred.
 
-Several concepts disappeared. Identity nearly disappeared as well, but survived in a narrower form: **persistent addressability**. Cognition may not require identity, but governance, relationships, authority transfer, commitments, and provenance across time appear to.
+An authorized actor can append history.
 
-The working rule is therefore:
+It cannot rewrite history through the supported kernel boundary.
 
-> **Attack v0.1 before extending it.**
+## Replaceable Intelligence
 
-Do not add a sixth primitive because it is useful or convenient. Add or change a primitive only when a concrete counterexample cannot be naturally expressed by the frozen five.
+EASTER does not require an agent, model, persona, conversation, or context window to be durable.
 
-## Status
+Those can all exist above the kernel.
 
-**FROZEN — architecture hypothesis, not implementation commitment.**
+```text
+Model A ─┐
+Agent B ─┼──▶ EASTER ───▶ durable authoritative history
+Human C ─┤
+Tool D  ─┘
+```
 
-Future discoveries do not silently modify v0.1. A breaking counterexample should be recorded with its evidence and used to propose a candidate v0.2 branch.
+A replacement runtime can inspect the same history and continue from it.
+
+This makes recovery a property of the durable substrate rather than the continued existence of a particular cognitive process.
+
+## Boundaries
+
+EASTER guarantees its semantics through the supported kernel boundary.
+
+The SQLite database is private kernel storage. Direct modification of SQLite is outside the kernel guarantee.
+
+Userland should interact with EASTER through supported operations rather than writing authoritative tables directly.
+
+Payloads are opaque JSON. Putting something inside a payload does not grant it kernel powers.
+
+## MCP
+
+EASTER includes an MCP server so compatible AI runtimes can interact with the kernel through a supported protocol boundary.
+
+MCP uses **stdio**. An MCP client launches `mcp_server.py` as a child process and communicates with it through the MCP protocol.
+
+The MCP surface exposes supported kernel operations and observational reads without adding new kernel semantics.
+
+## Console
+
+EASTER also includes a lightweight local Console.
+
+The Console communicates with EASTER exclusively through MCP. It does not access SQLite directly.
+
+It provides inspection of:
+
+* Evidence
+* Authority
+* grants
+* State
+* Transitions
+* Exceptions
+* Receipts
+
+It also exposes supported Authority operations.
+
+The Console is observational userland. It does not determine current State, preferred branches, truth, ancestry, or other meaning that the kernel itself does not own.
+
+The Console is currently constrained to loopback access.
 
 ## Quick Start
 
-This starts a new local EASTER instance. The SQLite database is the durable
-history for that instance.
-
-### Install and initialize
+### 1. Clone
 
 ```bash
 git clone https://github.com/witsbi/intelligence-kernel.git
 cd intelligence-kernel
+```
+
+### 2. Create an environment
+
+```bash
 python -m venv .venv
 .venv/bin/python -m pip install -r requirements-mcp.txt
+```
+
+### 3. Initialize EASTER
+
+Choose the identity that will hold Genesis root authority:
+
+```bash
 .venv/bin/python initialize.py data/kernel.db identity:your-root
 ```
 
-The final argument is the installer-selected root identity. Initialization
-creates `state:genesis`, the root Authority, `grant:genesis-root`, and the
-`BOOTSTRAP` Receipt atomically. It refuses to overwrite an existing database.
+Initialization creates the Genesis State, root Authority, Genesis root Grant, and `BOOTSTRAP` Receipt.
 
-### Start MCP and the Console
+It refuses to overwrite an existing database.
 
-MCP uses **stdio**: an MCP client launches the server as a child process and
-communicates with it through the MCP protocol. It is not an HTTP endpoint.
-For a diagnostic or manual invocation, the server command is:
-
-```bash
-KERNEL_DB_PATH=data/kernel.db .venv/bin/python mcp_server.py
-```
-
-Normal MCP operation should be managed by the MCP client: the client launches
-`mcp_server.py`, owns its stdio connection, and stops the child when the client
-session ends. Do not start a second standalone server for a client workflow.
-
-The Console launches its own MCP stdio child. Start it in another terminal:
+### 4. Start the Console
 
 ```bash
 KERNEL_DB_PATH=data/kernel.db \
@@ -183,158 +206,168 @@ CONSOLE_PORT=8420 \
 .venv/bin/python console.py
 ```
 
-Wait for `Application startup complete`, then open
-<http://127.0.0.1:8420/>. An HTTP 200 response from that URL means the Console
-is ready. The Console is observational userland; it does not own Kernel
-semantics.
+Wait for:
 
-### First governed workflow through MCP
-
-The following client uses the supported MCP tools and argument shapes. Save it
-as `quickstart.py` in the repository root and run it with
-`.venv/bin/python quickstart.py`. It launches its own MCP stdio server, so do
-not run a second copy for this example.
-
-```python
-import asyncio
-import json
-import sys
-
-from mcp import ClientSession
-from mcp.client.stdio import StdioServerParameters, stdio_client
-
-ROOT = "identity:your-root"
-ROOT_GRANT = "grant:genesis-root"
-ACTOR = "identity:first-actor"
-AUTHORITY = "authority:first-actor-scope"
-
-
-async def main():
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["mcp_server.py"],
-        cwd=".",
-        env={"KERNEL_DB_PATH": "data/kernel.db"},
-    )
-    async with stdio_client(params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-
-            async def call(name, arguments):
-                result = await session.call_tool(name, arguments)
-                if result.is_error:
-                    raise RuntimeError(result.content)
-                value = json.loads(result.content[0].text)
-                print(f"\\n{name}:\\n{json.dumps(value, indent=2)}")
-                return value
-
-            # Inspect Genesis and the installer-selected root grant.
-            await call("get_genesis_state", {})
-            await call("get_grant", {"grant_id": ROOT_GRANT})
-
-            # Identity creation is part of an authorized State transition.
-            created = await call("transition", {
-                "requester_identity_id": ROOT,
-                "from_state_id": "state:genesis",
-                "authority_grant_id": ROOT_GRANT,
-                "new_state_payload": {"event": "create first actor"},
-                "new_identities": [{
-                    "identity_id": ACTOR,
-                    "payload": {"role": "non-root test actor"},
-                }],
-            })
-
-            await call("define_authority", {
-                "requester_identity_id": ROOT,
-                "authority_grant_id": ROOT_GRANT,
-                "authority_id": AUTHORITY,
-                "is_root": False,
-                "payload": {"purpose": "ordinary state transition"},
-            })
-            actor_grant = await call("grant", {
-                "requester_identity_id": ROOT,
-                "authority_grant_id": ROOT_GRANT,
-                "identity_id": ACTOR,
-                "authority_id": AUTHORITY,
-                "payload": {"purpose": "ordinary state transition"},
-            })
-
-            evidence = await call("record_evidence", {
-                "requester_identity_id": ACTOR,
-                "authority_grant_id": actor_grant["grant_id"],
-                "payload": {"observation": "first actor is authorized"},
-            })
-            actor_transition = await call("transition", {
-                "requester_identity_id": ACTOR,
-                "from_state_id": created["state_id"],
-                "authority_grant_id": actor_grant["grant_id"],
-                "new_state_payload": {
-                    "event": "ordinary actor transition",
-                    "actor": ACTOR,
-                },
-                "evidence_ids": [evidence["evidence_id"]],
-            })
-
-            # Inspect records and relevant history.
-            await call("get_identity", {"identity_id": ACTOR})
-            await call("get_authority", {"authority_id": AUTHORITY})
-            await call("get_grant", {"grant_id": actor_grant["grant_id"]})
-            await call("get_evidence", {"evidence_id": evidence["evidence_id"]})
-            await call("get_state", {"state_id": actor_transition["state_id"]})
-            await call("get_transition", {
-                "transition_id": actor_transition["transition_id"],
-            })
-            await call("get_receipt", {
-                "receipt_id": actor_transition["receipt_id"],
-            })
-            await call("list_grants_for_identity", {"identity_id": ACTOR})
-            await call("list_transitions_from_state", {
-                "state_id": created["state_id"],
-            })
-            await call("list_records", {"record_type": "receipt"})
-
-
-asyncio.run(main())
+```text
+Application startup complete
 ```
 
-The returned IDs identify the resulting State, Transition, Receipt, and
-Evidence. An `ACCEPTED` Receipt records an operation outcome; it does not
-establish that a State is true or correct. Evidence is preserved provenance,
-not proof of truth. EASTER does not choose a current, canonical, or preferred
-State when branches exist.
+Then open:
 
-The Console can inspect the same records through query-parameter routes. Use
-the route syntax shown below (the identifiers are not path segments):
+```text
+http://127.0.0.1:8420/
+```
 
-| Record | Route |
-|---|---|
-| Genesis State | `/state/genesis` |
-| State | `/state?state_id=<state-id>` |
-| Identity | `/identity?identity_id=<identity-id>` |
-| Authority | `/authority?authority_id=<authority-id>` |
-| Evidence | `/evidence?evidence_id=<evidence-id>` |
-| Transition | `/transition?transition_id=<transition-id>` |
-| Receipt | `/receipt?receipt_id=<receipt-id>` |
-| Grant | `/grant?grant_id=<grant-id>` |
-| Records by type | `/browse?record_type=receipt` |
+The Console launches and owns its own MCP stdio child.
 
-The Console also has forms for `define_authority` and `grant`. Ordinary
-post-Genesis authority changes still require the supported EASTER operations
-and valid grants.
+## MCP Client Configuration
 
-### Stop and restart
-
-Stop the MCP client and Console with `Ctrl-C`. Restart the same instance using
-the same database path. The Console launches its own MCP stdio child; direct
-`mcp_server.py` execution is only a diagnostic/manual invocation:
+For normal MCP operation, configure your MCP client to launch:
 
 ```bash
-KERNEL_DB_PATH=data/kernel.db \
-CONSOLE_HOST=127.0.0.1 \
-CONSOLE_PORT=8420 \
-.venv/bin/python console.py
+.venv/bin/python mcp_server.py
 ```
 
-Use the previous IDs with the MCP getters or Console routes. Genesis and the
-authoritative history remain in `data/kernel.db`; restart does not rewrite or
-select a preferred branch.
+with:
+
+```text
+KERNEL_DB_PATH=data/kernel.db
+```
+
+The client should own the MCP server process and its stdio connection.
+
+Do not run a second standalone MCP server for the same client session.
+
+## First Governed Lifecycle
+
+A typical first lifecycle is:
+
+```text
+Genesis
+   │
+   ├── create actor
+   │
+   ├── define Authority
+   │
+   ├── issue Grant
+   │
+   ├── record Evidence
+   │
+   └── perform authorized Transition
+            │
+            ▼
+         New State
+            │
+            ├── Transition
+            └── Receipt
+```
+
+The resulting records can be inspected through MCP or the Console.
+
+Stop the runtime and restart it using the same database.
+
+The authoritative history remains available.
+
+EASTER does not require the original runtime or session to recover it.
+
+## Important Semantic Rules
+
+**History is append-only.**<br>
+Correction happens through later authorized operations, not mutation of accepted history.
+
+**Branching is valid.**<br>
+Multiple States may descend from the same State.
+
+**There is no kernel-defined current State.**<br>
+Userland chooses which branch to continue.
+
+**Evidence is not truth.**<br>
+EASTER records Evidence; it does not certify it.
+
+**Receipts are operation outcomes.**<br>
+`ACCEPTED` means the kernel admitted an operation. It does not mean the operation was wise or its payload was correct.
+
+**Payload cannot confer authority.**<br>
+Kernel powers come from kernel structures and operations, not JSON claims.
+
+**Authority is independent of State.**<br>
+Returning to an old State does not restore an Authority or Grant that has since been revoked.
+
+## Status
+
+EASTER currently consists of:
+
+**Kernel v0.1** — frozen six-primitive kernel semantics.
+
+**v0.2 observability** — MCP and Console inspection of the frozen kernel without adding new semantic authority.
+
+The complete supported lifecycle has been exercised from a fresh clone:
+
+```text
+clone
+  ↓
+install
+  ↓
+initialize Genesis
+  ↓
+MCP
+  ↓
+create actor / Authority / Grant
+  ↓
+Evidence
+  ↓
+authorized Transition
+  ↓
+inspect history
+  ↓
+stop
+  ↓
+restart
+  ↓
+recover durable history
+```
+
+The current development rule is:
+
+> **Attack the kernel before extending it.**
+
+New primitives or semantic powers should not be added merely because they are convenient. A semantic change should be justified by a concrete case the existing kernel cannot naturally represent.
+
+## Co-Creation
+
+EASTER was developed through sustained human–AI collaboration.
+
+**Nathan Woolen** directed the project, established its goals and acceptance boundaries, made final architectural decisions, and owns and maintains this repository.
+
+The architecture, implementation, adversarial testing, and documentation were developed iteratively with substantial contributions from:
+
+* **ChatGPT by OpenAI**
+* **Claude by Anthropic**
+
+Different models were used as collaborators, implementers, reviewers, and adversarial critics throughout development. Their outputs were not treated as authoritative by default; proposals were tested against the implementation, evidence, and the project's explicit human authority boundary.
+
+This development process is part of EASTER's provenance: interchangeable intelligence contributed to building a system designed so that intelligence itself can remain interchangeable.
+
+## Project History
+
+EASTER emerged from experiments in AI continuity, governed state, recovery, heterogeneous model orchestration, and persistent intelligence.
+
+Earlier designs contained substantially more machinery.
+
+The kernel was developed largely through subtraction: concepts were removed when they could live in userland without requiring kernel ownership.
+
+The final primitive set unexpectedly spelled:
+
+**Evidence · Authority · State · Transition · Exception · Receipt**
+
+**EASTER. 🪺**
+
+The name followed the architecture, not the other way around.
+
+## License
+
+EASTER is released under the **MIT License**.
+
+Copyright © 2026 Nathan Woolen.
+
+See `LICENSE` for the full license text.
