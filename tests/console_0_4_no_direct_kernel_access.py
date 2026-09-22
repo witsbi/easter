@@ -15,7 +15,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 SOURCE_PATH = HERE / "console.py"
 FORBIDDEN_SQLITE_CALL_NAMES = {"execute", "executemany", "executescript", "cursor"}
 

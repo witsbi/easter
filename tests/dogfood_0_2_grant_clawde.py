@@ -23,7 +23,7 @@ import time
 import urllib.parse
 from pathlib import Path
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 ROOT = "grant:genesis-root"
 NATHAN = "identity:nathan"
 CLAWDE = "identity:clawde"

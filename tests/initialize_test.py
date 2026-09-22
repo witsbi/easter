@@ -16,7 +16,7 @@ from initialize import initialize_database
 from kernel import Kernel
 
 
-HERE = Path(__file__).parent
+HERE = Path(__file__).resolve().parent.parent
 
 
 async def verify_mcp(db_path: Path, identity_id: str) -> None:
