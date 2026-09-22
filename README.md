@@ -141,15 +141,183 @@ Do not add a sixth primitive because it is useful or convenient. Add or change a
 
 Future discoveries do not silently modify v0.1. A breaking counterexample should be recorded with its evidence and used to propose a candidate v0.2 branch.
 
-## Fresh installation
+## Quick Start
 
-From a fresh clone, create the SQLite database with the supported initializer
-and choose the initial root identity:
+This starts a new local EASTER instance. The SQLite database is the durable
+history for that instance.
+
+### Install and initialize
 
 ```bash
-python initialize.py data/kernel.db identity:your-root
+git clone https://github.com/witsbi/intelligence-kernel.git
+cd intelligence-kernel
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements-mcp.txt
+.venv/bin/python initialize.py data/kernel.db identity:your-root
 ```
 
-The initializer creates Genesis, its root Authority and grant, and the
-`BOOTSTRAP` Receipt atomically. It refuses to overwrite an existing path.
-Start the existing Kernel/MCP boundary with `KERNEL_DB_PATH=data/kernel.db`.
+The final argument is the installer-selected root identity. Initialization
+creates `state:genesis`, the root Authority, `grant:genesis-root`, and the
+`BOOTSTRAP` Receipt atomically. It refuses to overwrite an existing database.
+
+### Start MCP and the Console
+
+MCP uses **stdio**: an MCP client launches the server as a child process and
+communicates with it through the MCP protocol. It is not an HTTP endpoint.
+The server command is:
+
+```bash
+KERNEL_DB_PATH=data/kernel.db .venv/bin/python mcp_server.py
+```
+
+The Console launches its own MCP stdio child. Start it in another terminal:
+
+```bash
+KERNEL_DB_PATH=data/kernel.db \
+CONSOLE_HOST=127.0.0.1 \
+CONSOLE_PORT=8420 \
+.venv/bin/python console.py
+```
+
+Wait for `Application startup complete`, then open
+<http://127.0.0.1:8420/>. An HTTP 200 response from that URL means the Console
+is ready. The Console is observational userland; it does not own Kernel
+semantics.
+
+### First governed workflow through MCP
+
+The following client uses the supported MCP tools and argument shapes. Save it
+as `quickstart.py` in the repository root and run it with
+`.venv/bin/python quickstart.py`. It launches its own MCP stdio server, so do
+not run a second copy for this example.
+
+```python
+import asyncio
+import json
+import sys
+
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+ROOT = "identity:your-root"
+ROOT_GRANT = "grant:genesis-root"
+ACTOR = "identity:first-actor"
+AUTHORITY = "authority:first-actor-scope"
+
+
+async def main():
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["mcp_server.py"],
+        cwd=".",
+        env={"KERNEL_DB_PATH": "data/kernel.db"},
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            async def call(name, arguments):
+                result = await session.call_tool(name, arguments)
+                if result.is_error:
+                    raise RuntimeError(result.content)
+                value = json.loads(result.content[0].text)
+                print(f"\\n{name}:\\n{json.dumps(value, indent=2)}")
+                return value
+
+            # Inspect Genesis and the installer-selected root grant.
+            await call("get_genesis_state", {})
+            await call("get_grant", {"grant_id": ROOT_GRANT})
+
+            # Identity creation is part of an authorized State transition.
+            created = await call("transition", {
+                "requester_identity_id": ROOT,
+                "from_state_id": "state:genesis",
+                "authority_grant_id": ROOT_GRANT,
+                "new_state_payload": {"event": "create first actor"},
+                "new_identities": [{
+                    "identity_id": ACTOR,
+                    "payload": {"role": "non-root test actor"},
+                }],
+            })
+
+            await call("define_authority", {
+                "requester_identity_id": ROOT,
+                "authority_grant_id": ROOT_GRANT,
+                "authority_id": AUTHORITY,
+                "is_root": False,
+                "payload": {"purpose": "ordinary state transition"},
+            })
+            actor_grant = await call("grant", {
+                "requester_identity_id": ROOT,
+                "authority_grant_id": ROOT_GRANT,
+                "identity_id": ACTOR,
+                "authority_id": AUTHORITY,
+                "payload": {"purpose": "ordinary state transition"},
+            })
+
+            evidence = await call("record_evidence", {
+                "requester_identity_id": ACTOR,
+                "authority_grant_id": actor_grant["grant_id"],
+                "payload": {"observation": "first actor is authorized"},
+            })
+            actor_transition = await call("transition", {
+                "requester_identity_id": ACTOR,
+                "from_state_id": created["state_id"],
+                "authority_grant_id": actor_grant["grant_id"],
+                "new_state_payload": {
+                    "event": "ordinary actor transition",
+                    "actor": ACTOR,
+                },
+                "evidence_ids": [evidence["evidence_id"]],
+            })
+
+            # Inspect records and relevant history.
+            await call("get_identity", {"identity_id": ACTOR})
+            await call("get_authority", {"authority_id": AUTHORITY})
+            await call("get_grant", {"grant_id": actor_grant["grant_id"]})
+            await call("get_evidence", {"evidence_id": evidence["evidence_id"]})
+            await call("get_state", {"state_id": actor_transition["state_id"]})
+            await call("get_transition", {
+                "transition_id": actor_transition["transition_id"],
+            })
+            await call("get_receipt", {
+                "receipt_id": actor_transition["receipt_id"],
+            })
+            await call("list_grants_for_identity", {"identity_id": ACTOR})
+            await call("list_transitions_from_state", {
+                "state_id": created["state_id"],
+            })
+            await call("list_records", {"record_type": "receipt"})
+
+
+asyncio.run(main())
+```
+
+The returned IDs identify the resulting State, Transition, Receipt, and
+Evidence. An `ACCEPTED` Receipt records an operation outcome; it does not
+establish that a State is true or correct. Evidence is preserved provenance,
+not proof of truth. EASTER does not choose a current, canonical, or preferred
+State when branches exist.
+
+The Console can inspect the same records at `/state`, `/transition`,
+`/receipt`, `/evidence`, `/authority`, `/grant`, and `/browse`. It also has
+forms for `define_authority` and `grant`. Ordinary post-Genesis authority
+changes still require the supported EASTER operations and valid grants.
+
+### Stop and restart
+
+Stop the MCP client/server and Console with `Ctrl-C`. Restart the same
+instance using the same database path:
+
+```bash
+KERNEL_DB_PATH=data/kernel.db .venv/bin/python mcp_server.py
+
+KERNEL_DB_PATH=data/kernel.db \
+CONSOLE_HOST=127.0.0.1 \
+CONSOLE_PORT=8420 \
+.venv/bin/python console.py
+```
+
+Use the previous IDs with the MCP getters or Console routes. Genesis and the
+authoritative history remain in `data/kernel.db`; restart does not rewrite or
+select a preferred branch.
