@@ -164,11 +164,15 @@ creates `state:genesis`, the root Authority, `grant:genesis-root`, and the
 
 MCP uses **stdio**: an MCP client launches the server as a child process and
 communicates with it through the MCP protocol. It is not an HTTP endpoint.
-The server command is:
+For a diagnostic or manual invocation, the server command is:
 
 ```bash
 KERNEL_DB_PATH=data/kernel.db .venv/bin/python mcp_server.py
 ```
+
+Normal MCP operation should be managed by the MCP client: the client launches
+`mcp_server.py`, owns its stdio connection, and stops the child when the client
+session ends. Do not start a second standalone server for a client workflow.
 
 The Console launches its own MCP stdio child. Start it in another terminal:
 
@@ -299,19 +303,32 @@ establish that a State is true or correct. Evidence is preserved provenance,
 not proof of truth. EASTER does not choose a current, canonical, or preferred
 State when branches exist.
 
-The Console can inspect the same records at `/state`, `/transition`,
-`/receipt`, `/evidence`, `/authority`, `/grant`, and `/browse`. It also has
-forms for `define_authority` and `grant`. Ordinary post-Genesis authority
-changes still require the supported EASTER operations and valid grants.
+The Console can inspect the same records through query-parameter routes. Use
+the route syntax shown below (the identifiers are not path segments):
+
+| Record | Route |
+|---|---|
+| Genesis State | `/state/genesis` |
+| State | `/state?state_id=<state-id>` |
+| Identity | `/identity?identity_id=<identity-id>` |
+| Authority | `/authority?authority_id=<authority-id>` |
+| Evidence | `/evidence?evidence_id=<evidence-id>` |
+| Transition | `/transition?transition_id=<transition-id>` |
+| Receipt | `/receipt?receipt_id=<receipt-id>` |
+| Grant | `/grant?grant_id=<grant-id>` |
+| Records by type | `/browse?record_type=receipt` |
+
+The Console also has forms for `define_authority` and `grant`. Ordinary
+post-Genesis authority changes still require the supported EASTER operations
+and valid grants.
 
 ### Stop and restart
 
-Stop the MCP client/server and Console with `Ctrl-C`. Restart the same
-instance using the same database path:
+Stop the MCP client and Console with `Ctrl-C`. Restart the same instance using
+the same database path. The Console launches its own MCP stdio child; direct
+`mcp_server.py` execution is only a diagnostic/manual invocation:
 
 ```bash
-KERNEL_DB_PATH=data/kernel.db .venv/bin/python mcp_server.py
-
 KERNEL_DB_PATH=data/kernel.db \
 CONSOLE_HOST=127.0.0.1 \
 CONSOLE_PORT=8420 \
