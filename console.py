@@ -28,10 +28,10 @@ Deliberately excluded, per EASTER-CONSOLE-0's brief:
     - no retry/dedup of transitions
     - no orchestration, no agent memory
 
-Exception retrieval and lineage/history inspection are not offered as
-controls: MCP-0 has no supported operation for either (see
-MCP_0_RECEIPT.md). Any Console page that would need one instead
-records the exact unanswerable question -- see CONSOLE_0_RECEIPT.md.
+The Console exposes the read-only observability operations added by
+MCP-0 v0.2, including Exception retrieval and bounded branch/record
+enumeration. It still does not invent ancestry, current-State, or
+branch-preference semantics that the Kernel does not define.
 
 Destructive/authority-changing actions (revoke, revoke_all) require
 the operator to re-type the exact target id into a confirmation field.
@@ -158,8 +158,14 @@ pre {{ background: #f0f0f0; padding: 1rem; overflow-x: auto; white-space: pre-wr
   <a href="/">home</a>
   <a href="/state/genesis">genesis</a>
   <a href="/state">state</a>
+  <a href="/identity">identity</a>
+  <a href="/authority">authority</a>
+  <a href="/evidence">evidence</a>
+  <a href="/transition">transition</a>
   <a href="/receipt">receipt</a>
+  <a href="/exception">exception</a>
   <a href="/grant">grant</a>
+  <a href="/browse">browse records</a>
   <a href="/authority/define">define authority</a>
   <a href="/grant/issue">issue grant</a>
   <a href="/grant/revoke">revoke grant</a>
@@ -231,7 +237,7 @@ def reject_cross_origin(request: Request) -> HTMLResponse | None:
 
 def result_block(is_error: bool, payload: Any) -> str:
     cls = "error" if is_error else ""
-    label = "MCP tool error (Kernel rejected the call)" if is_error else "Result"
+    label = "MCP tool error (operation not completed)" if is_error else "Result"
     pretty = payload if isinstance(payload, str) else json.dumps(payload, indent=2, sort_keys=True)
     return f'<p class="{cls}"><strong>{label}:</strong></p><pre>{html.escape(pretty)}</pre>'
 
@@ -245,6 +251,188 @@ def lookup_form(action: str, field: str, label: str) -> str:
   <button type="submit">Look up</button>
 </form>
 """
+
+
+def pagination_form(action: str, fields: list[tuple[str, str, str]]) -> str:
+    inputs = []
+    for name, label, value in fields:
+        inputs.append(
+            f'<label>{html.escape(label)} '
+            f'<input type="text" name="{html.escape(name)}" '
+            f'value="{html.escape(value)}"></label>'
+        )
+    return (
+        f'<form method="get" action="{html.escape(action)}">'
+        + "".join(inputs)
+        + '<button type="submit">Read</button></form>'
+    )
+
+
+def invalid_limit_response(body: str) -> HTMLResponse:
+    return page(
+        "Invalid form input",
+        body + '<p class="error">Invalid limit: enter an integer.</p>',
+        status_code=400,
+    )
+
+
+COMPOUND_ORDER_NOTICE = (
+    '<p class="warn">Results are ascending for stable pagination using '
+    '<code>created_at</code> and record id. This is not authoritative commit '
+    'order, causality, or precedence. When multiple transitions originate from '
+    'the same State, they represent valid branches; none is preferred by the '
+    'Kernel.</p>'
+)
+
+
+# ------------------------------------------------------------------
+# v0.2 read-only observability. These routes expose the supported MCP
+# operations without interpreting opaque payloads or choosing a branch.
+# ------------------------------------------------------------------
+
+
+async def get_identity(request: Request) -> HTMLResponse:
+    identity_id = request.query_params.get("identity_id", "").strip()
+    body = lookup_form("/identity", "identity_id", "identity_id")
+    if identity_id:
+        is_error, result = await mcp_client.call("get_identity", {"identity_id": identity_id})
+        body += result_block(is_error, result)
+    return page("Inspect Identity", body)
+
+
+async def get_authority(request: Request) -> HTMLResponse:
+    authority_id = request.query_params.get("authority_id", "").strip()
+    body = lookup_form("/authority", "authority_id", "authority_id")
+    if authority_id:
+        is_error, result = await mcp_client.call("get_authority", {"authority_id": authority_id})
+        body += result_block(is_error, result)
+    return page("Inspect Authority", body)
+
+
+async def get_evidence(request: Request) -> HTMLResponse:
+    evidence_id = request.query_params.get("evidence_id", "").strip()
+    body = (
+        lookup_form("/evidence", "evidence_id", "evidence_id")
+        + '<p class="warn">Evidence is immutable opaque content. Its presence '
+        'does not establish truth, correctness, authenticity, relevance, or sufficiency.</p>'
+    )
+    if evidence_id:
+        is_error, result = await mcp_client.call("get_evidence", {"evidence_id": evidence_id})
+        body += result_block(is_error, result)
+    return page("Inspect Evidence", body)
+
+
+async def get_transition(request: Request) -> HTMLResponse:
+    transition_id = request.query_params.get("transition_id", "").strip()
+    body = lookup_form("/transition", "transition_id", "transition_id")
+    if transition_id:
+        is_error, result = await mcp_client.call("get_transition", {"transition_id": transition_id})
+        body += result_block(is_error, result)
+    return page("Inspect Transition", body)
+
+
+async def get_exception(request: Request) -> HTMLResponse:
+    receipt_id = request.query_params.get("receipt_id", "").strip()
+    body = (
+        lookup_form("/exception", "receipt_id", "receipt_id")
+        + '<p class="warn">Exception payloads are kernel-recorded diagnostics. '
+        'They are displayed raw and do not establish external causality or truth.</p>'
+    )
+    if receipt_id:
+        is_error, result = await mcp_client.call(
+            "get_exception_by_receipt", {"receipt_id": receipt_id}
+        )
+        body += result_block(is_error, result)
+    return page("Inspect Exception by Receipt", body)
+
+
+async def list_grants(request: Request) -> HTMLResponse:
+    identity_id = request.query_params.get("identity_id", "").strip()
+    after = request.query_params.get("after", "").strip()
+    limit = request.query_params.get("limit", "50").strip()
+    body = pagination_form(
+        "/grants",
+        [("identity_id", "identity_id", identity_id), ("after", "opaque after cursor", after), ("limit", "limit", limit)],
+    )
+    body += '<p class="warn">Ordered by the Kernel-enforced authority sequence. '
+    body += 'Every grant is returned, including revoked and expired grants; existence is not validity.</p>'
+    try:
+        parsed_limit = int(limit or 50)
+    except ValueError:
+        return invalid_limit_response(body)
+    if identity_id:
+        is_error, result = await mcp_client.call(
+            "list_grants_for_identity",
+            {"identity_id": identity_id, "after": after or None, "limit": parsed_limit},
+        )
+        body += result_block(is_error, result)
+    return page("Grants for Identity", body)
+
+
+async def list_transitions_from_state(request: Request) -> HTMLResponse:
+    state_id = request.query_params.get("state_id", "").strip()
+    after = request.query_params.get("after", "").strip()
+    limit = request.query_params.get("limit", "50").strip()
+    body = pagination_form(
+        "/transitions/from-state",
+        [("state_id", "state_id", state_id), ("after", "opaque after cursor", after), ("limit", "limit", limit)],
+    ) + COMPOUND_ORDER_NOTICE
+    try:
+        parsed_limit = int(limit or 50)
+    except ValueError:
+        return invalid_limit_response(body)
+    if state_id:
+        is_error, result = await mcp_client.call(
+            "list_transitions_from_state",
+            {"state_id": state_id, "after": after or None, "limit": parsed_limit},
+        )
+        body += result_block(is_error, result)
+    return page("Transitions from State", body)
+
+
+async def list_transitions_by_grant(request: Request) -> HTMLResponse:
+    grant_id = request.query_params.get("authority_grant_id", "").strip()
+    after = request.query_params.get("after", "").strip()
+    limit = request.query_params.get("limit", "50").strip()
+    body = pagination_form(
+        "/transitions/by-grant",
+        [("authority_grant_id", "authority_grant_id", grant_id), ("after", "opaque after cursor", after), ("limit", "limit", limit)],
+    ) + COMPOUND_ORDER_NOTICE
+    try:
+        parsed_limit = int(limit or 50)
+    except ValueError:
+        return invalid_limit_response(body)
+    if grant_id:
+        is_error, result = await mcp_client.call(
+            "list_transitions_by_grant",
+            {"authority_grant_id": grant_id, "after": after or None, "limit": parsed_limit},
+        )
+        body += result_block(is_error, result)
+    return page("Transitions by Grant", body)
+
+
+async def list_records_view(request: Request) -> HTMLResponse:
+    record_type = request.query_params.get("record_type", "").strip()
+    after = request.query_params.get("after", "").strip()
+    limit = request.query_params.get("limit", "50").strip()
+    body = pagination_form(
+        "/browse",
+        [("record_type", "record_type", record_type), ("after", "opaque after cursor", after), ("limit", "limit", limit)],
+    )
+    body += '<p class="warn">This is an unfiltered flat record view. Receipt and grant '
+    body += 'ordering uses kernel-enforced append sequences; all other types use a stable '
+    body += 'created_at/id walk that is not authoritative commit order, causality, or precedence.</p>'
+    try:
+        parsed_limit = int(limit or 50)
+    except ValueError:
+        return invalid_limit_response(body)
+    if record_type:
+        is_error, result = await mcp_client.call(
+            "list_records",
+            {"record_type": record_type, "after": after or None, "limit": parsed_limit},
+        )
+        body += result_block(is_error, result)
+    return page("Browse Records", body)
 
 
 # ------------------------------------------------------------------
@@ -262,17 +450,25 @@ directly.</p>
 <ul>
   <li><a href="/state/genesis">Inspect Genesis</a></li>
   <li><a href="/state">Inspect a known State</a></li>
+  <li><a href="/identity">Inspect a known Identity</a></li>
+  <li><a href="/authority">Inspect a known Authority</a></li>
+  <li><a href="/evidence">Inspect known Evidence</a></li>
+  <li><a href="/transition">Inspect a known Transition</a></li>
   <li><a href="/receipt">Inspect a known Receipt</a></li>
+  <li><a href="/exception">Inspect Exception diagnostics by Receipt</a></li>
   <li><a href="/grant">Inspect a known Grant</a></li>
+  <li><a href="/grants">Browse all Grants for an Identity</a></li>
+  <li><a href="/transitions/from-state">Browse all branches from a State</a></li>
+  <li><a href="/transitions/by-grant">Browse Transitions authorized by a Grant</a></li>
+  <li><a href="/browse">Browse records by type</a></li>
   <li><a href="/authority/define">Define an Authority</a></li>
   <li><a href="/grant/issue">Issue a Grant</a></li>
   <li><a href="/grant/revoke">Revoke a Grant</a> (requires typed confirmation)</li>
   <li><a href="/grant/revoke-all">Revoke all Grants for an identity</a> (requires typed confirmation)</li>
 </ul>
-<p class="warn">Not offered: Exception retrieval, lineage/history
-traversal, full graph enumeration -- EASTER-MCP-0 has no supported
-operation for any of these. See CONSOLE_0_RECEIPT.md for the exact
-questions this Console cannot answer as a result.</p>
+<p class="warn">The browse pages expose bounded, ascending reads only. They do not
+choose a current State, canonical or preferred branch, or interpret payloads.
+List ordering is not generally causality or authoritative commit order.</p>
 """
     return page("Home", body)
 
@@ -506,8 +702,17 @@ routes = [
     Route("/", home),
     Route("/state/genesis", get_genesis_state),
     Route("/state", get_state),
+    Route("/identity", get_identity),
+    Route("/authority", get_authority),
+    Route("/evidence", get_evidence),
+    Route("/transition", get_transition),
     Route("/receipt", get_receipt),
+    Route("/exception", get_exception),
     Route("/grant", get_grant),
+    Route("/grants", list_grants),
+    Route("/transitions/from-state", list_transitions_from_state),
+    Route("/transitions/by-grant", list_transitions_by_grant),
+    Route("/browse", list_records_view),
     Route("/authority/define", define_authority_view, methods=["GET"]),
     Route("/authority/define", define_authority_submit, methods=["POST"]),
     Route("/grant/issue", grant_issue_view, methods=["GET"]),
