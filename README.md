@@ -140,3 +140,16 @@ Do not add a sixth primitive because it is useful or convenient. Add or change a
 **FROZEN — architecture hypothesis, not implementation commitment.**
 
 Future discoveries do not silently modify v0.1. A breaking counterexample should be recorded with its evidence and used to propose a candidate v0.2 branch.
+
+## Fresh installation
+
+From a fresh clone, create the SQLite database with the supported initializer
+and choose the initial root identity:
+
+```bash
+python initialize.py data/kernel.db identity:your-root
+```
+
+The initializer creates Genesis, its root Authority and grant, and the
+`BOOTSTRAP` Receipt atomically. It refuses to overwrite an existing path.
+Start the existing Kernel/MCP boundary with `KERNEL_DB_PATH=data/kernel.db`.
