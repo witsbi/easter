@@ -1,5 +1,7 @@
 # EASTER
 
+**EASTER lets one AI agent pick up where another left off. It keeps the important history so the next agent can figure out what happened and what to do next.
+
 **A small deterministic kernel for persistent, governed state across interchangeable AI runtimes.**
 
 EASTER preserves authoritative history independently of the model, agent, process, or conversation currently doing the work.
