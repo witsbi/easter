@@ -4,7 +4,17 @@
 
 **I use OpenClaw/Hermes:**
 
-copy this prompt 'Go to the witsbi/easter GitHub repository and follow the installation instructions. Install EASTER and connect it to yourself as an MCP server. Ask me what identity I want to use, initialize that identity with Genesis root authority, then register yourself as a separate agent identity in EASTER.'  
+1. Copy this prompt:
+
+Go to the witsbi/easter GitHub repository, follow the installation instructions, install EASTER, and connect it to yourself as an MCP server. Ask me what identity I want to use for Genesis root authority. Do not access EASTER by importing its Python kernel directly; use the MCP interface for EASTER operations.
+
+2. Start a fresh Hermes session.
+
+This is necessary so Hermes loads the newly installed EASTER MCP tools.
+
+3. Copy this prompt:
+
+Use EASTER to establish yourself as a separate agent identity and prepare to use EASTER to keep track of our work. 
 
 **That's it done. Then just tell the agent to use EASTER when doing work.**
 
