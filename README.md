@@ -4,9 +4,9 @@
 
 **I use OpenClaw/Hermes:**
 
-copy this prompt "Go to the witsbi/easter GitHub repository, follow the installation instructions, install EASTER, and connect it to yourself as an MCP server. Initialize me as the root user."  
+copy this prompt 'Go to the witsbi/easter GitHub repository, follow the installation instructions, install EASTER, and connect it to yourself as an MCP server. Initialize me as the root user.'  
 
-**Thats it done. Then just tell the agent to use EASTER when doing work.**
+**That's it done. Then just tell the agent to use EASTER when doing work.**
 
 **A small deterministic kernel for persistent, governed state across interchangeable AI runtimes.**
 
