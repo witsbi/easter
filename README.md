@@ -2,7 +2,11 @@
 
 **EASTER lets one AI agent pick up where another left off. It keeps the important history so the next agent can figure out what happened and what to do next.**
 
-**I use OpenClaw/Hermes → copy this prompt "Go to the witsbi/easter GitHub repository, follow the installation instructions, install EASTER, and connect it to yourself as an MCP server. Initialize me as the root user." → done.**
+**I use OpenClaw/Hermes:**
+
+copy this prompt "Go to the witsbi/easter GitHub repository, follow the installation instructions, install EASTER, and connect it to yourself as an MCP server. Initialize me as the root user."  
+
+**Thats it done. Then just tell the agent to use EASTER when doing work.**
 
 **A small deterministic kernel for persistent, governed state across interchangeable AI runtimes.**
 
