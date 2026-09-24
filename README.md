@@ -174,8 +174,8 @@ The Console is currently constrained to loopback access.
 ### 1. Clone
 
 ```bash
-git clone https://github.com/witsbi/intelligence-kernel.git
-cd intelligence-kernel
+git clone https://github.com/witsbi/easter.git
+cd easter
 ```
 
 ### 2. Create an environment
