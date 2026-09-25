@@ -256,6 +256,45 @@ The client should own the MCP server process and its stdio connection.
 
 Do not run a second standalone MCP server for the same client session.
 
+## HTTP API
+
+EASTER-API-0 provides a JSON/HTTP mapping of the supported MCP operations:
+
+```text
+HTTP client -> api_server.py -> MCP stdio client -> mcp_server.py -> Kernel
+```
+
+The API is a thin adapter: request bodies use the same argument names as the
+MCP tools, return values retain their JSON shapes, and pagination cursors are
+passed through opaquely. It does not import `kernel.py`, open SQLite, infer
+current/preferred State, or add retry/deduplication behavior.
+
+Start it against the same database configuration as MCP:
+
+```bash
+KERNEL_DB_PATH=data/kernel.db \
+API_HOST=127.0.0.1 \
+API_PORT=8430 \
+.venv/bin/python api_server.py
+```
+
+`GET /healthz` is the readiness endpoint, and `GET /openapi.json` serves an
+OpenAPI 3.0.3 description of the 19 frozen operations. API routes are under
+`/v1/` and cover the ten v0.1 operations plus the nine accepted v0.2
+observability operations.
+
+Each MCP argument has exactly one HTTP representation. For example, the grant
+to revoke is identified only by the URL path in
+`POST /v1/grants/{grant_id}/revoke`; a `grant_id` in that request's JSON body is
+rejected with `400` rather than silently reinterpreted.
+
+**Launch contract.** The API is loopback-only until a remote authentication and
+authorization design exists. The supported launch is
+`.venv/bin/python api_server.py`, which refuses a non-loopback `API_HOST`. The
+restriction is also enforced on every request: any client whose address is not
+a loopback IP receives `403`, so launching the ASGI app directly (for example
+`uvicorn api_server:app --host 0.0.0.0`) does not expose it.
+
 ## First Governed Lifecycle
 
 A typical first lifecycle is:
