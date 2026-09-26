@@ -101,22 +101,77 @@ EOF
     echo "lease grant: $LEASE_GRANT_ID"
 fi
 
-step "3. Mint an agent token"
-echo "The token prints ONCE -- have somewhere to store it."
-prompt "Agent identity id" "identity:worker"
+step "3. Provision the agent"
+echo "An agent needs its OWN kernel identity and its OWN grant."
+echo "Grants are identity-bound: the kernel rejects an identity wielding"
+echo "another identity's grant, so the gateway's lease cannot be reused."
+prompt "Agent identity id" "identity:hermes"
 AGENT_ID="$ANSWER"
-prompt "Grant ids (comma-separated)" "$LEASE_GRANT_ID"
-AGENT_GRANTS="$ANSWER"
+
+if confirm "Create $AGENT_ID in the kernel (skipped if it exists)?"; then
+    $COMPOSE exec -T gateway python - "$AGENT_ID" "$ROOT_IDENTITY" <<'EOF'
+import sys
+from kernel import Kernel
+agent_id, root_id = sys.argv[1], sys.argv[2]
+k = Kernel("/data/kernel.db")
+if k.get_identity(agent_id):
+    print(f"{agent_id} already exists -- skipping creation")
+else:
+    k.transition(
+        requester_identity_id=root_id,
+        from_state_id="state:genesis",
+        authority_grant_id="grant:genesis-root",
+        new_state_payload={"agent": agent_id},
+        transition_payload={"reason": "agent identity bootstrap"},
+        new_identities=[{"identity_id": agent_id,
+                         "payload": {"role": "agent"}}],
+    )
+    print(f"{agent_id} created")
+EOF
+fi
+
+prompt "Agent grant length in days" "30"
+AGENT_DAYS="$ANSWER"
+AGENT_GRANT_ID=""
+echo "This issues a grant of authority:root to $AGENT_ID, valid ${AGENT_DAYS} days."
+echo "That is full kernel authority through the channel: the agent can do"
+echo "anything root can while the grant is live. Expiry is the dead-man's"
+echo "switch; revocation is the kill switch."
+if confirm "Issue the agent grant?"; then
+    AGENT_GRANT_ID=$($COMPOSE exec -T gateway python - "$AGENT_DAYS" "$ROOT_IDENTITY" "$AGENT_ID" <<'EOF'
+import sys
+from datetime import datetime, timedelta, timezone
+from kernel import Kernel
+days, root_id, agent_id = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+k = Kernel("/data/kernel.db")
+expires = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat().replace("+00:00", "Z")
+g = k.grant(
+    requester_identity_id=root_id,
+    authority_grant_id="grant:genesis-root",
+    identity_id=agent_id,
+    authority_id="authority:root",
+    expires_at=expires,
+    payload={"role": "agent-grant", "note": "EASTER-GATEWAY-0 agent authority"},
+)
+print(g["grant_id"])
+print("expires " + expires, file=sys.stderr)
+EOF
+)
+    echo "agent grant: $AGENT_GRANT_ID"
+fi
+
+step "4. Mint the agent token"
+echo "The token prints ONCE -- have somewhere to store it."
 prompt "Role" "agent"
 AGENT_ROLE="$ANSWER"
-prompt "Token TTL in seconds" "3600"
+prompt "Token TTL in seconds" "86400"
 AGENT_TTL="$ANSWER"
-if [ -z "$AGENT_GRANTS" ]; then
-    echo "no grant ids given -- skipping the mint. Re-run when ready." >&2
-elif confirm "Mint token for $AGENT_ID (grants: $AGENT_GRANTS, role: $AGENT_ROLE, ttl: ${AGENT_TTL}s)?"; then
+if [ -z "$AGENT_GRANT_ID" ]; then
+    echo "no agent grant was issued -- skipping the mint. Re-run when ready." >&2
+elif confirm "Mint token for $AGENT_ID (grant: $AGENT_GRANT_ID, role: $AGENT_ROLE, ttl: ${AGENT_TTL}s)?"; then
     echo "--- token: store it now ---"
     $COMPOSE exec -T gateway python gateway.py mint \
-        --identity "$AGENT_ID" --grants "$AGENT_GRANTS" \
+        --identity "$AGENT_ID" --grants "$AGENT_GRANT_ID" \
         --role "$AGENT_ROLE" --ttl "$AGENT_TTL" \
         --sessions /data/sessions.json
     echo "---------------------------"
@@ -132,6 +187,8 @@ Channel test:
 Kill switches:
   Revoke one agent token:
     $COMPOSE exec -T gateway python gateway.py revoke-token <token-or-prefix> --sessions /data/sessions.json
+  Revoke the agent's authority (the grant itself, via the console channel):
+    kernel revoke on the agent grant id; every later write with it fails.
   Revoke the gateway's power (invalidates grants it HOLDS, not grants it issued):
     kernel revoke_all on identity:gateway through this same console channel,
     then revoke affected agent identities individually if the fleet itself
