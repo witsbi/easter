@@ -8,6 +8,9 @@ database:
   GW-2  Smuggled requester_identity_id -> overwritten with the session
         identity (the operation is attributed to the session, and a
         foreign identity's (lack of) grants cannot be borrowed).
+  GW-2b Direct durable assertion: the committed transition record
+        carries the session's grant, whose holder is the session
+        identity -- not the smuggled one.
   GW-3  Foreign authority_grant_id -> 403 at the gateway, kernel
         untouched (no receipt-spam: receipt count does not move).
   GW-4  Admin tool (grant) -> 403. Admin tools exist in no gateway role.
@@ -15,10 +18,25 @@ database:
   GW-6  Structural: gateway.py never imports kernel.py / sqlite3 and
         never opens the kernel database itself (same technique as
         api_0_3_no_direct_kernel_access.py).
+  GW-7  Revoked grant + live token -> 403 trip-wire: the session is
+        killed server-side and kernel spam is bounded to exactly one
+        rejected receipt; later attempts 403 at the gateway.
+  GW-7b Born-expired grant + live token -> 403 at the gateway's
+        liveness pre-check: zero receipts, session revoked.
+  GW-8  Reader role: reads work (shared-read invariant is documented,
+        not enforced), writes -> 403.
+  GW-9  Unknown tool -> 403.
+  GW-10 TTL is capped at MAX_TTL_SECONDS; non-positive ttl is refused.
+        serve defaults to loopback.
+  GW-11 Corrupt session file fails closed (403, never 500) and the
+        gateway recovers when the file is restored.
+  GW-12 revoke-token accepts the unambiguous prefix shown by list;
+        ambiguous prefixes are refused.
 
 Run:  cd ~/workspace/easter && /tmp/gw-venv/bin/python tests/gateway_0_1_skeleton.py
 """
 
+import datetime as dt
 import http.client
 import json
 import os
@@ -29,14 +47,15 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
-sys.path.insert(0, "/home/hatch/workspace/easter")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from initialize import initialize_database
 from kernel import Kernel
 
 import gateway
-from gateway import SessionStore, make_app, MCPBackend
+from gateway import SessionStore, make_app, MCPBackend, _token_hash, _build_parser
 
 PORT = 18443
 ROOT = "identity:root"
@@ -57,7 +76,7 @@ check.failed = False
 
 
 def main():
-    tmp = Path = __import__("pathlib").Path(tempfile.mkdtemp(prefix="gw0_"))
+    tmp = Path(tempfile.mkdtemp(prefix="gw0_"))
     db = tmp / "kernel.db"
     sessions = tmp / "sessions.json"
     cert = tmp / "cert.pem"
@@ -98,11 +117,19 @@ def main():
         identity_id=WORKER, grant_ids=[WORKER_GRANT], role="agent",
         ttl_seconds=600, label="gw-0-1-agent",
     )
+    counter_token = store.mint(
+        identity_id=WORKER, grant_ids=[WORKER_GRANT], role="reader",
+        ttl_seconds=600, label="gw-0-1-counter",
+    )
+    # An expired session, built deterministically: mint live, backdate.
     dead_token = store.mint(
         identity_id=WORKER, grant_ids=[WORKER_GRANT], role="agent",
-        ttl_seconds=0, label="gw-0-1-expired",
+        ttl_seconds=600, label="gw-0-1-expired",
     )
-    assert store.lookup(dead_token) is None, "ttl=0 token must read as expired"
+    data = store._load()
+    data[_token_hash(dead_token)]["expires_at"] = "2000-01-01T00:00:00Z"
+    store._save(data)
+    assert store.lookup(dead_token) is None, "backdated token must read as expired"
 
     # --- self-signed cert for the test listener ---
     subprocess.run(
@@ -156,53 +183,66 @@ def main():
             return resp.status, {"_raw": raw}
 
     def receipt_count():
-        st, body = post("list_records", agent_token, {"record_type": "receipt", "limit": 1000})
+        st, body = post("list_records", counter_token, {"record_type": "receipt", "limit": 1000})
         assert st == 200, f"list_records failed: {body}"
         return len(body["result"]["items"])
+
+    def transition_body(from_state, **kw):
+        b = {
+            "from_state_id": from_state,
+            "authority_grant_id": WORKER_GRANT,
+            "new_state_payload": {"gw": "0-1"},
+        }
+        b.update(kw)
+        return b
 
     try:
         wait_ready()
 
         # --- GW-1: valid token, transition through the gateway ---
-        st, body = post("transition", agent_token, {
-            "requester_identity_id": WORKER,  # will be (re)bound anyway
-            "from_state_id": "state:genesis",
-            "authority_grant_id": WORKER_GRANT,
-            "new_state_payload": {"gw": "0-1", "n": 1},
-            "transition_payload": {"reason": "GW-1"},
-        })
+        st, body = post("transition", agent_token, transition_body(
+            "state:genesis",
+            requester_identity_id=WORKER,  # will be (re)bound anyway
+            new_state_payload={"gw": "0-1", "n": 1},
+            transition_payload={"reason": "GW-1"},
+        ))
         check("GW-1: valid token transition succeeds", st == 200, f"status={st} {str(body)[:100]}")
         s1 = body["result"]["state_id"] if st == 200 else None
 
         # --- GW-2: smuggled identity is overwritten ---
-        st2, body2 = post("transition", agent_token, {
-            "requester_identity_id": INTRUDER,  # smuggle attempt
-            "from_state_id": s1,
-            "authority_grant_id": WORKER_GRANT,
-            "new_state_payload": {"gw": "0-1", "n": 2},
-            "transition_payload": {"reason": "GW-2 smuggle"},
-        })
+        st2, body2 = post("transition", agent_token, transition_body(
+            s1,
+            requester_identity_id=INTRUDER,  # smuggle attempt
+            new_state_payload={"gw": "0-1", "n": 2},
+            transition_payload={"reason": "GW-2 smuggle"},
+        ))
         # If the smuggle had worked, the kernel would reject: intruder
         # holds no grants ("does not hold grant"). Success proves the
         # gateway overwrote the identity with the session's.
         ok2 = st2 == 200
         check("GW-2: smuggled requester_identity_id is overwritten", ok2,
               f"status={st2} {str(body2)[:100]}")
+        s2 = body2["result"]["state_id"] if ok2 else s1
+
+        # --- GW-2b: direct durable assertion on the committed record ---
         if ok2:
-            stl, bl = post("list_transitions_by_grant", agent_token,
-                           {"authority_grant_id": WORKER_GRANT})
-            ids = [t["transition_id"] for t in bl["result"]["items"]]
-            check("GW-2: smuggled op attributed to session grant",
-                  body2["result"]["transition_id"] in ids)
+            tid = body2["result"]["transition_id"]
+            _, tr = post("get_transition", agent_token, {"transition_id": tid})
+            tgrant = tr["result"]["authority_grant_id"]
+            _, gr = post("get_grant", agent_token, {"grant_id": tgrant})
+            check("GW-2b: transition record carries the session grant",
+                  tgrant == WORKER_GRANT, f"grant={tgrant}")
+            check("GW-2b: session grant is held by the session identity, not the intruder",
+                  gr["result"]["identity_id"] == WORKER, f"holder={gr['result']['identity_id']}")
 
         # --- GW-3: foreign grant id -> 403, kernel untouched ---
         before = receipt_count()
-        st3, body3 = post("transition", agent_token, {
-            "requester_identity_id": WORKER,
-            "from_state_id": s1,
-            "authority_grant_id": ROOT_GRANT,  # not in session set
-            "new_state_payload": {"gw": "0-1", "evil": True},
-        })
+        st3, body3 = post("transition", agent_token, transition_body(
+            s2,
+            requester_identity_id=WORKER,
+            authority_grant_id=ROOT_GRANT,  # not in session set
+            new_state_payload={"gw": "0-1", "evil": True},
+        ))
         check("GW-3: foreign authority_grant_id rejected", st3 == 403, f"status={st3}")
         check("GW-3: no receipt-spam (receipt count unchanged)",
               receipt_count() == before, f"before={before}")
@@ -217,16 +257,121 @@ def main():
         check("GW-4: admin tool 'grant' unreachable via gateway", st4 == 403, f"status={st4}")
 
         # --- GW-5: bad and expired tokens ---
-        st5a, _ = post("transition", "bogus-token", {"from_state_id": s1})
+        st5a, _ = post("transition", "bogus-token", {"from_state_id": s2})
         check("GW-5a: bogus token rejected", st5a == 403, f"status={st5a}")
-        st5b, _ = post("transition", dead_token, {"from_state_id": s1})
+        st5b, _ = post("transition", dead_token, {"from_state_id": s2})
         check("GW-5b: expired token rejected", st5b == 403, f"status={st5b}")
-        st5c, _ = post("transition", None, {"from_state_id": s1})
+        st5c, _ = post("transition", None, {"from_state_id": s2})
         check("GW-5c: missing token rejected", st5c == 401, f"status={st5c}")
         check("GW-5: no receipt-spam from bad tokens", receipt_count() == before)
 
+        # --- GW-8: reader role ---
+        reader_token = store.mint(
+            identity_id=WORKER, grant_ids=[WORKER_GRANT], role="reader",
+            ttl_seconds=600, label="gw-0-1-reader",
+        )
+        st8a, _ = post("list_records", reader_token, {"record_type": "receipt", "limit": 1})
+        check("GW-8a: reader role can read (shared-read invariant is documented)",
+              st8a == 200, f"status={st8a}")
+        st8b, _ = post("transition", reader_token, transition_body(s2))
+        check("GW-8b: reader role cannot write", st8b == 403, f"status={st8b}")
+
+        # --- GW-9: unknown tool ---
+        st9, _ = post("no_such_tool", agent_token, {})
+        check("GW-9: unknown tool denied", st9 == 403, f"status={st9}")
+
+        # --- GW-10: TTL bounds and loopback default ---
+        big = store.mint(
+            identity_id=WORKER, grant_ids=[WORKER_GRANT], role="agent",
+            ttl_seconds=10 ** 9, label="gw-huge-ttl",
+        )
+        exp = gateway._parse_ts(store._load()[_token_hash(big)]["expires_at"])
+        remaining = (exp - dt.datetime.now(dt.timezone.utc)).total_seconds()
+        check("GW-10a: ttl capped at MAX_TTL_SECONDS",
+              remaining <= gateway.MAX_TTL_SECONDS + 5, f"remaining={remaining:.0f}s")
+        refused = 0
+        for bad in (0, -30):
+            try:
+                store.mint(identity_id=WORKER, grant_ids=[WORKER_GRANT],
+                           role="agent", ttl_seconds=bad)
+            except ValueError:
+                refused += 1
+        check("GW-10b: non-positive ttl refused", refused == 2)
+        serve_args = _build_parser().parse_args(
+            ["serve", "--cert", "c", "--key", "k"])
+        check("GW-10c: serve defaults to loopback",
+              serve_args.host == "127.0.0.1", f"host={serve_args.host}")
+
+        # --- GW-12: revoke by prefix ---
+        gw12_token = store.mint(
+            identity_id=WORKER, grant_ids=[WORKER_GRANT], role="agent",
+            ttl_seconds=600, label="gw12",
+        )
+        prefix = next(e["token_prefix"] for e in store.list_sessions()
+                      if e["label"] == "gw12")
+        try:
+            store.revoke("")
+            check("GW-12a: ambiguous prefix refused", False, "empty prefix matched one")
+        except ValueError:
+            check("GW-12a: ambiguous prefix refused", True)
+        check("GW-12b: revoke by unambiguous prefix works",
+              store.revoke(prefix) is True)
+        check("GW-12c: revoked-by-prefix token is dead",
+              store.lookup(gw12_token) is None)
+
+        # --- GW-11: corrupt session file fails closed ---
+        raw_sessions = sessions.read_bytes()
+        sessions.write_bytes(b"{corrupt")
+        st11, _ = post("transition", agent_token, transition_body(s2))
+        check("GW-11a: corrupt session file -> 403, never 500", st11 == 403, f"status={st11}")
+        sessions.write_bytes(raw_sessions)
+        st11b, _ = post("get_state", agent_token, {"state_id": "state:genesis"})
+        check("GW-11b: gateway recovers when the file is restored", st11b == 200,
+              f"status={st11b}")
+
+        # --- GW-7: revoked grant + live token -> trip-wire ---
+        kernel.revoke(
+            requester_identity_id=ROOT,
+            authority_grant_id=ROOT_GRANT,
+            grant_id=WORKER_GRANT,
+        )
+        before7 = receipt_count()
+        st7, body7 = post("transition", agent_token, transition_body(s2))
+        check("GW-7a: revoked grant -> 403", st7 == 403, f"status={st7} {str(body7)[:80]}")
+        check("GW-7b: trip-wire bounds kernel spam to exactly one receipt",
+              receipt_count() == before7 + 1, f"before={before7}")
+        st7c, _ = post("transition", agent_token, transition_body(s2))
+        check("GW-7c: session killed after trip-wire (later attempts 403 at gateway)",
+              st7c == 403, f"status={st7c}")
+        check("GW-7d: no further receipts after the kill",
+              receipt_count() == before7 + 1)
+
+        # --- GW-7b: born-expired grant + live token -> pre-check, zero receipts ---
+        eg = kernel.grant(
+            requester_identity_id=ROOT,
+            authority_grant_id=ROOT_GRANT,
+            identity_id=WORKER,
+            authority_id=AUTH,
+            valid_from="1999-01-01T00:00:00Z",
+            expires_at="2000-01-01T00:00:00Z",
+            payload={"gw": "expired-grant"},
+        )
+        exp_token = store.mint(
+            identity_id=WORKER, grant_ids=[eg["grant_id"]], role="agent",
+            ttl_seconds=600, label="gw-expired-grant",
+        )
+        before7b = receipt_count()
+        st7e, _ = post("transition", exp_token, {
+            "from_state_id": s2,
+            "authority_grant_id": eg["grant_id"],
+            "new_state_payload": {"gw": "0-1"},
+        })
+        check("GW-7e: expired grant -> 403 at the gateway", st7e == 403, f"status={st7e}")
+        check("GW-7f: zero kernel receipts for the expired grant (liveness pre-check)",
+              receipt_count() == before7b, f"before={before7b}")
+
         # --- GW-6: structural no-direct-kernel-access ---
-        src = (__import__("pathlib").Path(gateway.__file__)).read_text()
+        src = Path(gateway.__file__).read_text()
         check("GW-6a: gateway.py never imports kernel",
               "import kernel" not in src and "from kernel" not in src)
         check("GW-6b: gateway.py never imports sqlite3", "sqlite3" not in src)
