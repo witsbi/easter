@@ -1,0 +1,16 @@
+# EASTER gateway container dependencies (GATEWAY-0).
+#
+# Everything gateway.py imports directly: mcp, starlette, uvicorn.
+# The mcp pin lives in requirements-mcp.txt (shared with the stdio
+# path); starlette and uvicorn are pinned here because only the
+# containerized gateway needs the web stack, and the stdio install
+# stays lean without it.
+#
+# mcp==2.2.0 declares starlette>=0.27 and uvicorn>=0.31.1 with no upper
+# bound. The versions below are what pip resolved on 2026-09-26, pinned
+# so the image build is reproducible instead of floating on mcp's open
+# range. Re-resolve (fresh pip install, record the versions) before
+# bumping mcp.
+-r ../../requirements-mcp.txt
+starlette==1.7.0
+uvicorn==0.34.0

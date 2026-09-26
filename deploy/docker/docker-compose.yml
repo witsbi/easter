@@ -1,0 +1,26 @@
+services:
+  gateway:
+    build:
+      # Resolved relative to this file: the repository root.
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: easter-gateway:0
+    container_name: easter-gateway
+    ports:
+      # Loopback only. The container itself listens on 0.0.0.0:8443,
+      # but Docker publishes it solely on the host's 127.0.0.1.
+      # LAN exposure needs real TLS/host hardening first (deferred).
+      - "127.0.0.1:8443:8443"
+    volumes:
+      # Named volume (native Linux fs): kernel DB, session store,
+      # and the self-signed cert persist across rebuilds.
+      - easter-data:/data
+    environment:
+      # Root identity seeded into a fresh kernel DB on first run.
+      # Change BEFORE the first start; afterwards the DB already exists
+      # and this is ignored.
+      EASTER_ROOT_IDENTITY: identity:nathan
+    restart: unless-stopped
+
+volumes:
+  easter-data:
