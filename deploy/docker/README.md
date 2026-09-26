@@ -33,6 +33,16 @@ Per the design, there is no human-auth code path in the gateway. Nathan
 as root performs the ceremony through the console channel -- here, that
 is `docker compose exec` against the container's kernel database.
 
+The guided script walks the three steps below, printing every command
+and waiting for confirmation at each one. Run from the repo root:
+
+```bash
+sh deploy/docker/root-ceremony.sh
+```
+
+The manual equivalents (what the script runs) are documented here for
+reference.
+
 **1. Create the gateway identity** (root-authorized transition):
 
 ```bash
@@ -117,8 +127,10 @@ The next `up` re-seeds from scratch.
 - The port is published on `127.0.0.1` only. LAN exposure needs real
   TLS certificates and host hardening first -- deliberately not here.
 - The cert is self-signed: use `curl -k` / `verify=False` for now.
-- Known gap (council review): `requirements-mcp.txt` pins only `mcp`;
-  the Dockerfile pins `uvicorn==0.34.0` itself until that file is fixed.
+- Python dependencies for the container are pinned in
+  `deploy/docker/requirements-gateway.txt` (mcp via `requirements-mcp.txt`,
+  plus explicit starlette/uvicorn pins so the build doesn't float on mcp's
+  open version ranges). Re-resolve before bumping mcp.
 - To front an *existing* kernel DB instead of a fresh one, replace the
   named volume with a bind mount of the DB file. SQLite handles the
   container/host multi-process access, but take a backup first.

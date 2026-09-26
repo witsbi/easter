@@ -15,12 +15,14 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements-mcp.txt ./
-# NOTE (known gap, council review): requirements-mcp.txt pins only mcp,
-# but gateway.py also imports uvicorn and starlette. starlette arrives
-# transitively via the mcp dependency; uvicorn is pinned here until
-# requirements-mcp.txt is fixed.
-RUN pip install --no-cache-dir -r requirements-mcp.txt "uvicorn==0.34.0"
+COPY requirements-mcp.txt ./requirements-mcp.txt
+# The gateway's own manifest includes requirements-mcp.txt by relative
+# path, so both files are copied in a layout that preserves that
+# relationship (repo-root file at ./, deploy-local file at
+# ./deploy/docker/). requirements-mcp.txt itself stays lean for the
+# stdio (mcp_server.py) path, which needs no web stack.
+COPY deploy/docker/requirements-gateway.txt ./deploy/docker/requirements-gateway.txt
+RUN pip install --no-cache-dir -r deploy/docker/requirements-gateway.txt
 
 COPY kernel.py mcp_server.py gateway.py initialize.py schema.sql ./
 COPY deploy/docker/entrypoint.sh /usr/local/bin/easter-entrypoint
