@@ -41,11 +41,17 @@ What this skeleton does:
   - Per-role tool allowlist. The agent role cannot reach ``grant``,
     ``revoke``, ``revoke_all`` or ``define_authority`` through this
     gateway, ever. Those tools exist in no role.
-  - Read invariant (explicit, not solved): GATEWAY-0 authenticates
-    callers and constrains mutation authority; it does NOT provide
-    record-level confidentiality between authenticated identities. Any
-    authenticated token can read any record, including grants. Do not
-    mistake authenticated transport for tenant isolation.
+  - Read invariant (explicit, not solved): identity and grant
+    enumeration is self-scoped -- list_grants_for_identity and
+    get_identity are forced to the session identity, get_grant only
+    serves the session's own grant set, and list_records refuses the
+    grant/identity record types (the session-scoped tools cover the
+    legitimate need). Every other read is shared-world: any
+    authenticated token can read any state, transition, receipt,
+    evidence, authority, or exception record. GATEWAY-0 authenticates
+    callers and constrains mutation authority; it does not provide
+    general record-level confidentiality. Do not mistake authenticated
+    transport for tenant isolation.
   - Invalid, expired, or killed tokens are rejected (401/403) before
     MCP is ever called.
 
@@ -468,6 +474,24 @@ def _bind_arguments(
 
     if tool in {"list_grants_for_identity", "get_identity"} and "identity_id" in bound:
         bound["identity_id"] = session["identity_id"]
+
+    # Grant/identity enumeration is self-scoped, consistently. The
+    # session-scoped tools above already force the session identity, so
+    # the generic paths must not offer a bypass: list_records has no
+    # server-side identity filter (filtering gateway-side would break
+    # pagination), so the grant/identity record types are refused
+    # outright; get_grant only serves the session's own grant set,
+    # mirroring the authority_grant_id membership check.
+    if tool == "list_records" and bound.get("record_type") in {"grant", "identity"}:
+        raise GatewayError(
+            "record_type 'grant'/'identity' is not enumerable via "
+            "list_records; use the session-scoped tools",
+            403,
+        )
+
+    if tool == "get_grant" and "grant_id" in bound:
+        if bound["grant_id"] not in session["grant_ids"]:
+            raise GatewayError("grant is not bound to this session", 403)
 
     return bound
 

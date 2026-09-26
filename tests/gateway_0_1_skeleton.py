@@ -26,6 +26,10 @@ database:
   GW-8  Reader role: reads work (shared-read invariant is documented,
         not enforced), writes -> 403.
   GW-9  Unknown tool -> 403.
+  GW-13 Grant/identity enumeration is self-scoped with no bypass:
+        list_records refuses the grant/identity record types, get_grant
+        serves only the session's own grant set, other record types
+        stay shared-world.
   GW-10 TTL is capped at MAX_TTL_SECONDS; non-positive ttl is refused.
         serve defaults to loopback.
   GW-11 Corrupt session file fails closed (403, never 500) and the
@@ -279,6 +283,24 @@ def main():
         # --- GW-9: unknown tool ---
         st9, _ = post("no_such_tool", agent_token, {})
         check("GW-9: unknown tool denied", st9 == 403, f"status={st9}")
+
+        # --- GW-13: grant/identity enumeration is self-scoped, no bypass ---
+        st13a, _ = post("list_records", agent_token, {"record_type": "grant", "limit": 5})
+        check("GW-13a: list_records cannot enumerate grants", st13a == 403,
+              f"status={st13a}")
+        st13b, _ = post("list_records", agent_token, {"record_type": "identity", "limit": 5})
+        check("GW-13b: list_records cannot enumerate identities", st13b == 403,
+              f"status={st13b}")
+        st13c, _ = post("get_grant", agent_token, {"grant_id": ROOT_GRANT})
+        check("GW-13c: get_grant refused outside the session grant set",
+              st13c == 403, f"status={st13c}")
+        st13d, bg13d = post("get_grant", agent_token, {"grant_id": WORKER_GRANT})
+        check("GW-13d: get_grant serves the session's own grants",
+              st13d == 200 and bg13d["result"]["grant_id"] == WORKER_GRANT,
+              f"status={st13d}")
+        st13e, _ = post("list_records", agent_token, {"record_type": "receipt", "limit": 5})
+        check("GW-13e: other record types stay shared-world", st13e == 200,
+              f"status={st13e}")
 
         # --- GW-10: TTL bounds and loopback default ---
         big = store.mint(
