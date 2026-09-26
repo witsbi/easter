@@ -78,32 +78,61 @@ output), `user_fact` (explicitly attributed to the user), `decision`
 summary plus a stable reference), `warning`. Separate observed facts from
 interpretations; label interpretations as interpretations.
 
-## 3. Anchor pointer file — `.easter/pointer` (repo convention)
+## 3. Anchor — `project_anchor` evidence (API-only)
 
-Not a kernel record. A small JSON file at the repo root (or workstream root)
-so a new agent can find the work stream's tip without guessing:
+The tip of a project's work stream is tracked inside EASTER itself, so that
+agents with no repo access can still discover and resume work. After every
+checkpoint transition, record an anchor evidence record:
 
 ```json
 {
-  "project": "easter-gateway-docker",
-  "state_id": "state:<tip>",
-  "updated_at": "2026-09-26T22:00:00Z",
-  "updated_by": "identity:hermes"
+  "authority_grant_id": "grant:<a live grant from the current session>",
+  "payload": {
+    "kind": "project_anchor",
+    "project": "<project-name>",
+    "state_id": "state:<the new tip from the transition result>",
+    "transition_id": "transition:<the checkpoint's transition>",
+    "updated_at": "2026-09-26T22:00:00Z",
+    "updated_by": "identity:<recording agent>"
+  }
 }
 ```
 
-The pointer is a **hint**; the kernel history is the truth. A resuming agent:
+Evidence is immutable; the **latest anchor per project wins** (max
+`updated_at`). This is a userland heuristic — the kernel deliberately has
+no canonical-head concept, so "current tip" is a convention agents agree on,
+not a kernel fact. Adequate at human-plus-a-few-agents scale; a busier
+deployment would want a registry with authoritative sequencing.
 
-1. Reads the pointer → `get_state(state_id)` → checks the tip's `status`.
-2. Walks `list_transitions_from_state` / `get_transition` and `get_evidence`
-   for the supporting records; verifies receipts rather than trusting prose.
-3. Revalidates volatile facts (repo state, branch tip, service health).
-4. Records a new transition noting that responsibility was resumed.
+Discovery, API-only:
 
-If the pointer is missing or stale, fall back to a conventional evidence tag
-(`"project": "<name>"` in evidence payloads) to locate the history. EASTER
-preserves branches without declaring a canonical one; the pointer names the
-tip by convention, the full history stays auditable underneath.
+1. `list_records("evidence")` (paginated), keep items with
+   `payload.kind == "project_anchor"` and matching `project`.
+2. Tip = the anchor with the greatest `updated_at`.
+3. `get_state(tip)` → walk `list_transitions_from_state` / `get_transition`
+   / `get_evidence`; verify receipts; revalidate volatile facts.
+4. Record a new transition noting responsibility was resumed.
+
+A project's **first** checkpoint uses `from_state_id: "state:genesis"` —
+the universal, API-discoverable root.
+
+### Optional local pointer file
+
+Agents that *do* work in a repo may additionally keep `.easter/pointer`
+at the workstream root:
+
+```json
+{
+  "project": "<project-name>",
+  "state_id": "state:<tip>",
+  "updated_at": "2026-09-26T22:00:00Z",
+  "updated_by": "identity:<agent>"
+}
+```
+
+This is a convenience cache for repo-using agents only. The anchor
+evidence record is the source of truth; if they disagree, the anchor wins
+and the pointer should be refreshed.
 
 ## What this does not cover
 
