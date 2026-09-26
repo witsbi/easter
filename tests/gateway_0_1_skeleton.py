@@ -30,6 +30,9 @@ database:
         list_records refuses the grant/identity record types, get_grant
         serves only the session's own grant set, other record types
         stay shared-world.
+  GW-14 get_identity/list_grants_for_identity inject the session
+        identity when the argument is absent and overwrite it when
+        smuggled: always self-scoped, never a 502 on a missing arg.
   GW-10 TTL is capped at MAX_TTL_SECONDS; non-positive ttl is refused.
         serve defaults to loopback.
   GW-11 Corrupt session file fails closed (403, never 500) and the
@@ -301,6 +304,27 @@ def main():
         st13e, _ = post("list_records", agent_token, {"record_type": "receipt", "limit": 5})
         check("GW-13e: other record types stay shared-world", st13e == 200,
               f"status={st13e}")
+
+        # --- GW-14: self-scoped identity tools inject the session identity ---
+        # Regression: get_identity/list_grants_for_identity with no
+        # identity_id argument used to forward the call unbound, and the
+        # MCP server rejected the missing required argument (502). The
+        # session identity is now injected when absent, overwritten when
+        # smuggled -- the tool is always self-scoped.
+        st14a, bg14a = post("get_identity", agent_token, {})
+        check("GW-14a: get_identity with no args returns the session identity",
+              st14a == 200 and bg14a["result"]["identity_id"] == WORKER,
+              f"status={st14a} {str(bg14a)[:100]}")
+        st14b, bg14b = post("get_identity", agent_token, {"identity_id": INTRUDER})
+        check("GW-14b: smuggled identity_id is overwritten with the session identity",
+              st14b == 200 and bg14b["result"]["identity_id"] == WORKER,
+              f"status={st14b} {str(bg14b)[:100]}")
+        st14c, bg14c = post("list_grants_for_identity", agent_token, {})
+        got14c = st14c == 200 and all(
+            g["identity_id"] == WORKER for g in bg14c["result"]["items"]
+        )
+        check("GW-14c: list_grants_for_identity with no args is self-scoped",
+              got14c, f"status={st14c} {str(bg14c)[:100]}")
 
         # --- GW-10: TTL bounds and loopback default ---
         big = store.mint(
