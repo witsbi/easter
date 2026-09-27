@@ -1,0 +1,21 @@
+[package]
+name = "easter-console"
+version = "0.1.0"
+edition = "2021"
+description = "Native terminal console for browsing an EASTER governed-state kernel (read-only)"
+
+[[bin]]
+name = "easter-console"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = 2
