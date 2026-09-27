@@ -5,3 +5,6 @@ __pycache__/
 
 # Private TLS key material for the LAN reverse proxy (see deploy/nginx/README.md)
 deploy/nginx/certs/
+
+# Rust console build artifacts
+console-rs/target/
