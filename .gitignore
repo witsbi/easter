@@ -2,3 +2,6 @@ data/kernel.db
 __pycache__/
 *.pyc
 .venv/
+
+# Private TLS key material for the LAN reverse proxy (see deploy/nginx/README.md)
+deploy/nginx/certs/

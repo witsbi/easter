@@ -456,9 +456,10 @@ def _bind_arguments(
       the session's grant set. A foreign grant id is rejected here, at
       the gateway, before the kernel ever sees it.
     - identity_id query arguments (e.g. list_grants_for_identity) are
-      forced to the session identity: one session cannot enumerate
-      another identity's grants through this gateway. (Other read tools
-      are intentionally shared-world; see the module docstring.)
+      injected from the session when absent and forced to it when
+      present: one session cannot enumerate another identity's grants
+      through this gateway. (Other read tools are intentionally
+      shared-world; see the module docstring.)
     """
     bound = dict(arguments)
 
@@ -472,7 +473,11 @@ def _bind_arguments(
                 "authority_grant_id is not bound to this session", 403
             )
 
-    if tool in {"list_grants_for_identity", "get_identity"} and "identity_id" in bound:
+    if tool in {"list_grants_for_identity", "get_identity"}:
+        # Always the session identity: injected when absent, overwritten
+        # when smuggled. One session cannot enumerate another identity's
+        # grants through this gateway, and the tool is usable without
+        # passing an argument that would be ignored anyway.
         bound["identity_id"] = session["identity_id"]
 
     # Grant/identity enumeration is self-scoped, consistently. The

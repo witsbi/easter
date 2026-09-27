@@ -1,0 +1,27 @@
+# LAN reverse proxy for the EASTER gateway (and anything else later).
+#
+# Terminates TLS with the private-CA cert (see README.md). The gateway
+# itself stays unexposed past loopback on 8443; nginx reaches it over
+# the shared easter-lan Docker network at https://easter-gateway:8443.
+#
+# From the repository root:
+#   cd deploy/nginx
+#   docker compose up -d
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: easter-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - easter-lan
+    restart: unless-stopped
+
+networks:
+  easter-lan:
+    name: easter-lan

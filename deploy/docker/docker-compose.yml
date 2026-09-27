@@ -21,6 +21,17 @@ services:
       # and this is ignored.
       EASTER_ROOT_IDENTITY: identity:nathan
     restart: unless-stopped
+    networks:
+      - easter-lan
 
 volumes:
   easter-data:
+
+networks:
+  # Predictable name, auto-created by compose. A reverse proxy on this
+  # host (e.g. an nginx container started with plain `docker run`)
+  # joins it with: docker network connect easter-lan <container>
+  # so it can reach the gateway at https://easter-gateway:8443
+  # without 8443 being published past loopback.
+  easter-lan:
+    name: easter-lan

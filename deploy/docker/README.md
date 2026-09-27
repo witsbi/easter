@@ -84,8 +84,10 @@ print("lease grant:", g["grant_id"], "expires", expires)
 EOF
 ```
 
-**3. Mint an agent token.** First give the agent an identity and a grant
-(same pattern as above, or reuse the lease grant), then:
+**3. Mint an agent token.** First give the agent its OWN identity and its
+OWN grant (same pattern as above; grants are identity-bound, so the
+gateway's lease grant cannot be reused — the kernel rejects an identity
+wielding another identity's grant), then:
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml exec gateway \
