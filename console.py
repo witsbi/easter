@@ -101,7 +101,11 @@ class ConsoleMCPClient:
         self.session: ClientSession | None = None
 
     async def start(self) -> None:
-        env = {"KERNEL_DB_PATH": self._kernel_db_path} if self._kernel_db_path else None
+        # Resolve to an absolute path: the child is spawned with cwd=HERE
+        # (the repo dir), so a relative KERNEL_DB_PATH from the operator's
+        # shell would otherwise resolve against the wrong directory.
+        db_path = os.path.abspath(self._kernel_db_path) if self._kernel_db_path else None
+        env = {"KERNEL_DB_PATH": db_path} if db_path else None
         params = StdioServerParameters(
             command=sys.executable,
             args=[str(MCP_SERVER_PATH)],
