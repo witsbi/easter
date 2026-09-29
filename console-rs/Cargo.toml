@@ -2,7 +2,7 @@
 name = "easter-console"
 version = "0.1.0"
 edition = "2021"
-description = "Native terminal console for browsing an EASTER governed-state kernel (read-only)"
+description = "Native terminal console for an EASTER governed-state kernel: read-only browsing plus MCP write surfaces with enforced short write windows"
 
 [[bin]]
 name = "easter-console"
@@ -11,11 +11,14 @@ path = "src/main.rs"
 [dependencies]
 ratatui = "0.29"
 crossterm = "0.28"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 2
