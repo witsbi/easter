@@ -9,7 +9,7 @@ use crate::model::{
     summarize_state, summarize_transition, GrantStatus, LineageNode, TreeRow,
 };
 use crate::snapshot::refresh_snapshot;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -430,30 +430,51 @@ impl App {
         Ok(app)
     }
 
-    pub fn reload(&mut self) {
+    /// Re-read the snapshot from disk. The operator's view is
+    /// preserved across the swap: same tab, same search filter, and the
+    /// same record re-selected by id when it still exists (records are
+    /// append-only, so it normally does). On failure the old state is
+    /// left untouched and the error is returned -- the caller decides
+    /// what the operator sees.
+    pub fn reload(&mut self) -> Result<()> {
         let cfg = AppConfig {
             db_path: self.db_path.clone(),
             live_db: self.live_db.clone(),
             mcp_server_py: self.mcp_server_py.clone(),
             python: self.python.clone(),
         };
+        // Capture view state before the swap.
+        let tab = self.tab;
+        let selected_id = self.selected_id();
+        let query = self.query.clone();
+        let searching = self.searching;
         // Preserve the operator's in-session identity/grant memory and
         // any open form across reloads.
-        let (last_identity, last_grant, write_form) =
-            (self.last_identity.clone(), self.last_grant.clone(), self.write_form.take());
-        self.status_msg = match Self::load(&cfg) {
-            Ok(fresh) => {
-                *self = fresh;
-                self.last_identity = last_identity;
-                self.last_grant = last_grant;
-                self.write_form = write_form;
-                "reloaded from disk".to_string()
-            }
+        let (last_identity, last_grant, write_form) = (
+            self.last_identity.clone(),
+            self.last_grant.clone(),
+            self.write_form.take(),
+        );
+        let mut fresh = match Self::load(&cfg) {
+            Ok(fresh) => fresh,
             Err(e) => {
                 self.write_form = write_form;
-                format!("reload failed: {e:#}")
+                return Err(e).context("reload failed");
             }
         };
+        fresh.last_identity = last_identity;
+        fresh.last_grant = last_grant;
+        fresh.write_form = write_form;
+        fresh.tab = tab;
+        fresh.query = query;
+        fresh.searching = searching;
+        if let Some(id) = selected_id {
+            if let Some(i) = fresh.rows().iter().position(|r| r.id == id) {
+                fresh.list_state.select(Some(i));
+            }
+        }
+        *self = fresh;
+        Ok(())
     }
 
     // -- write forms --------------------------------------------------------
@@ -561,12 +582,16 @@ impl App {
         if let Err(e) = refresh_snapshot(&live_db, &self.db_path) {
             note = format!(" -- snapshot refresh failed: {e:#}");
         }
-        // Reload from the (refreshed) snapshot, keeping the in-session
-        // identity/grant memory.
-        let (li, lg) = (self.last_identity.clone(), self.last_grant.clone());
-        self.reload();
-        self.last_identity = li;
-        self.last_grant = lg;
+        // Reload from the (refreshed) snapshot. A reload failure must
+        // NOT be silently overwritten by the success message below: the
+        // write did commit (the kernel confirms before the tool
+        // returns), but the operator would be browsing stale pre-write
+        // data with no indication anything went wrong.
+        if let Err(e) = self.reload() {
+            note.push_str(&format!(
+                " -- RELOAD FAILED: {e:#}; browsing stale pre-write data"
+            ));
+        }
 
         let get = |k: &str| result.get(k).and_then(Value::as_str).unwrap_or("?");
         let summary = match tool.as_str() {
@@ -995,7 +1020,12 @@ impl App {
             Char('/') => {
                 self.searching = true;
             }
-            Char('r') => self.reload(),
+            Char('r') => {
+                self.status_msg = match self.reload() {
+                    Ok(()) => "reloaded from disk".to_string(),
+                    Err(e) => format!("{e:#}"),
+                };
+            }
             Char('e') => self.open_write_form(FormKind::RecordEvidence),
             Char('d') => self.open_write_form(FormKind::RecordDecision),
             Char('t') => self.open_write_form(FormKind::ProposeTransition),
@@ -1548,6 +1578,120 @@ mod tests {
         assert!(app.handle_key(Char('e')));
         terminal.draw(|f| app.render(f)).unwrap();
         assert!(app.handle_key(Esc));
+    }
+
+    #[test]
+    fn reload_preserves_tab_selection_and_search() {
+        // Review finding 3: a reload must not bounce the operator back
+        // to the Lineage tab at row 0 with their filter cleared.
+        use crossterm::event::KeyCode::*;
+        let (_dir, mut app) = test_app_with_writes();
+
+        assert!(app.handle_key(Char('2'))); // States tab
+        app.query = "genesis".to_string();
+        let selected = app.selected_id();
+        assert!(selected.is_some());
+
+        app.reload().expect("reload failed");
+
+        assert_eq!(app.tab, 1, "reload bounced the operator to another tab");
+        assert_eq!(app.query, "genesis", "reload cleared the search filter");
+        assert_eq!(app.selected_id(), selected, "reload lost the selection");
+    }
+
+    #[test]
+    fn reload_failure_leaves_old_state_intact() {
+        use crossterm::event::KeyCode::*;
+        let (dir, mut app) = test_app_with_writes();
+        assert!(app.handle_key(Char('2')));
+        let (tab, selected) = (app.tab, app.selected_id());
+
+        // Scoped to the test's tempdir so no other test can create it.
+        app.db_path = dir
+            .path()
+            .join("nope")
+            .join("snap.db")
+            .to_string_lossy()
+            .into_owned();
+        let err = app.reload().expect_err("reload of a missing db must fail");
+        assert!(
+            format!("{err:#}").contains("reload failed"),
+            "unexpected: {err:#}"
+        );
+
+        // The old view is untouched, not half-swapped.
+        assert_eq!(app.tab, tab);
+        assert_eq!(app.selected_id(), selected);
+    }
+
+    #[test]
+    fn successful_write_keeps_operator_on_their_tab() {
+        // Finding 3 end-to-end: submitting from the Evidence tab must
+        // not bounce the operator back to Lineage at row 0.
+        use crossterm::event::KeyCode::*;
+        let (_dir, mut app) = test_app_with_writes();
+        assert!(app.handle_key(Char('5'))); // Evidence tab
+        assert_eq!(app.tab, 4);
+
+        assert!(app.handle_key(Char('e')));
+        type_text(&mut app, "identity:test-nathan");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "grant:genesis-root");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "{\"note\":\"stay on tab test\"}");
+        assert!(app.handle_key(Enter));
+        assert!(
+            app.status_msg.contains("recorded"),
+            "unexpected status: {}",
+            app.status_msg
+        );
+
+        assert_eq!(app.tab, 4, "submit bounced the operator off the Evidence tab");
+        assert!(app
+            .evidence
+            .iter()
+            .any(|e| e.payload.contains("stay on tab test")));
+    }
+
+    #[test]
+    fn submit_reports_reload_failure_honestly() {
+        // Review finding 2 end-to-end: the MCP write succeeds, but the
+        // snapshot refresh AND the reload both fail (db_path points at
+        // a directory, so the refresh can't publish over it and the
+        // reload can't open it). The operator must see that the write
+        // committed yet they are browsing stale data -- not a clean
+        // success message.
+        use crossterm::event::KeyCode::*;
+        let (dir, mut app) = test_app_with_writes();
+        let dirpath = dir.path().join("as-dir");
+        std::fs::create_dir(&dirpath).unwrap();
+        app.db_path = dirpath.to_string_lossy().into_owned();
+
+        assert!(app.handle_key(Char('e')));
+        type_text(&mut app, "identity:test-nathan");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "grant:genesis-root");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "{\"note\":\"reload failure test\"}");
+        assert!(app.handle_key(Enter));
+
+        // run_submit returns Ok (the write committed; failing here
+        // would invite a duplicate submit) so the form closes, but the
+        // status must not claim a clean success.
+        assert!(app.write_form.is_none());
+        let msg = &app.status_msg;
+        assert!(
+            msg.contains("recorded"),
+            "write not acknowledged: {msg}"
+        );
+        assert!(
+            msg.contains("RELOAD FAILED"),
+            "reload failure hidden: {msg}"
+        );
+        assert!(
+            msg.contains("stale"),
+            "stale-data warning missing: {msg}"
+        );
     }
 
     #[test]
