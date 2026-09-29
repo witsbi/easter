@@ -44,8 +44,9 @@ easter-console --db kernel.db --dump grants
 Views for `--dump`: `lineage | states | transitions | receipts | evidence | grants`.
 
 `EASTER_MCP_SERVER` and `EASTER_PYTHON` locate the MCP server subprocess
-(defaults: `mcp_server.py` next to the repo layout / current directory, and
-`python3`). When `EASTER_LIVE_DB` / `--live-db` is unset, the `e`/`d`/`t`
+(defaults: `python3`; server found by walking up from the executable toward
+the repo root, then the current directory and its parent). When
+`EASTER_LIVE_DB` / `--live-db` is unset, the `e`/`d`/`t`
 write keys are disabled and the console is purely a browser.
 
 ## The TUI

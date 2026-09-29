@@ -33,6 +33,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use ui::{App, AppConfig};
 
@@ -81,19 +82,45 @@ fn main() -> Result<()> {
     run_tui(&cfg)
 }
 
-/// Best-effort location of `mcp_server.py`: next to an installed layout
-/// first, then the current directory (repo root). A missing file is a
-/// clear submit-time error, not a startup failure -- browsing still works.
+/// Best-effort location of `mcp_server.py`: `EASTER_MCP_SERVER` wins when
+/// set; otherwise the first existing candidate wins, searched in order:
+/// walking up from the executable (covers `console-rs/target/release`
+/// and `target/debug` back to the repo root, plus installed layouts like
+/// `<prefix>/bin/easter-console` -> `<prefix>/mcp_server.py`), then the
+/// current directory and its parent (covers launching from the repo root
+/// or from `console-rs/`, per the README).
+/// A missing file is a clear submit-time error, not a startup failure --
+/// browsing still works.
 fn default_mcp_server() -> String {
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("../mcp_server.py");
-            if cand.exists() {
-                return cand.to_string_lossy().into_owned();
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    find_mcp_server(exe_dir.as_deref(), &cwd)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "mcp_server.py".to_string())
+}
+
+/// Ordered candidate search for `mcp_server.py`; the first existing file
+/// wins. Pure function of its inputs so the search order is unit-testable.
+fn find_mcp_server(exe_dir: Option<&Path>, cwd: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(mut dir) = exe_dir.map(Path::to_path_buf) {
+        // console-rs/target/release needs three levels to reach the repo
+        // root; keep one spare for deeper install layouts.
+        for _ in 0..4 {
+            candidates.push(dir.join("mcp_server.py"));
+            match dir.parent() {
+                Some(parent) => dir = parent.to_path_buf(),
+                None => break,
             }
         }
     }
-    "mcp_server.py".to_string()
+    candidates.push(cwd.join("mcp_server.py"));
+    if let Some(parent) = cwd.parent() {
+        candidates.push(parent.join("mcp_server.py"));
+    }
+    candidates.into_iter().find(|c| c.exists())
 }
 
 fn print_help() {
@@ -238,5 +265,64 @@ fn event_loop(
             Event::Resize(_, _) => {}
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod default_server_tests {
+    use super::*;
+    use std::fs;
+
+    /// Fake repo layout: <root>/mcp_server.py plus
+    /// <root>/console-rs/target/release/ as the exe dir.
+    fn fake_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("mcp_server.py"), b"# fake server").unwrap();
+        fs::create_dir_all(dir.path().join("console-rs/target/release")).unwrap();
+        fs::create_dir_all(dir.path().join("console-rs")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn finds_server_from_cargo_release_layout() {
+        // The documented build: exe at console-rs/target/release, launched
+        // from console-rs/ where no mcp_server.py exists. Previously this
+        // resolved to the nonexistent console-rs/target/mcp_server.py.
+        let repo = fake_repo();
+        let exe_dir = repo.path().join("console-rs/target/release");
+        let cwd = repo.path().join("console-rs");
+        let found = find_mcp_server(Some(exe_dir.as_path()), &cwd)
+            .expect("must find the repo-root server");
+        assert_eq!(found, repo.path().join("mcp_server.py"));
+    }
+
+    #[test]
+    fn finds_server_from_cwd_parent() {
+        // No usable exe dir (e.g. test harness); launched from console-rs/.
+        let repo = fake_repo();
+        let cwd = repo.path().join("console-rs");
+        let found = find_mcp_server(None, &cwd).expect("must find via cwd parent");
+        assert_eq!(found, repo.path().join("mcp_server.py"));
+    }
+
+    #[test]
+    fn prefers_exe_layout_over_cwd() {
+        // An installed layout's server wins over a stray copy in cwd.
+        let repo = fake_repo();
+        let prefix = repo.path().join("prefix");
+        let bin = prefix.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(prefix.join("mcp_server.py"), b"# installed server").unwrap();
+        let cwd = repo.path().join("console-rs");
+        let found = find_mcp_server(Some(bin.as_path()), &cwd).unwrap();
+        assert_eq!(found, prefix.join("mcp_server.py"));
+    }
+
+    #[test]
+    fn returns_none_when_no_server_anywhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(find_mcp_server(Some(empty.as_path()), &empty).is_none());
     }
 }
