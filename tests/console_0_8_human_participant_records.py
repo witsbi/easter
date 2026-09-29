@@ -15,6 +15,9 @@ Proves:
      (no normative vote/approval semantics below the Console).
   4. transition works through the Console with the same non-root
      grant, including evidence association; receipt attributes nathan.
+     An empty JSON object ({}) for new_state_payload is forwarded to
+     MCP rather than rejected by Console validation (the Kernel
+     accepts it).
   5. Authority is still enforced through these forms: a grant the
      requester does not hold, and a grant that does not exist, are
      both rejected by the Kernel (no Console bypass).
@@ -338,6 +341,34 @@ def main() -> None:
             assert transition["payload"]["requester_identity_id"] == NATHAN
             assert transition["payload"]["identity_id"] == NATHAN
             assert transition["payload"]["via"] == "console-participant-form"
+
+            # 4b. Empty-object projection: `{}` is a valid JSON object and
+            #     must reach MCP -- the Console must not impose stricter
+            #     semantics than the Kernel. The Kernel accepts an empty
+            #     new_state_payload (no emptiness check in
+            #     kernel.transition) and commits a new state whose payload
+            #     is exactly {}.
+            status, body = http_post_form(
+                port,
+                "/transition/propose",
+                {
+                    "requester_identity_id": NATHAN,
+                    "from_state_id": GENESIS,
+                    "authority_grant_id": participant_grant,
+                    "new_state_payload": "{}",
+                    "transition_payload": "{}",
+                },
+            )
+            assert status == 200
+            is_error, result = extract_result(body)
+            assert not is_error, result
+            empty_state_id = result["state_id"]
+
+            is_error, empty_state = mcp_call(
+                db_path, "get_state", {"state_id": empty_state_id}
+            )
+            assert not is_error, empty_state
+            assert empty_state["payload"] == {}, empty_state["payload"]
 
             # 5a. Authority still enforced: a grant Nathan does not hold is
             #     rejected by the Kernel through the same form.

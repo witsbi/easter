@@ -907,7 +907,7 @@ async def transition_propose_submit(request: Request) -> HTMLResponse:
     new_state_payload, error = _parse_json_object(
         form.get("new_state_payload"), "new_state_payload"
     )
-    if error or not new_state_payload:
+    if error or new_state_payload is None:
         return page(
             "Propose Transition -- invalid input",
             TRANSITION_PROPOSE_FORM
