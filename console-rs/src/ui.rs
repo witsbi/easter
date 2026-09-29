@@ -3,11 +3,14 @@
 use crate::db::{
     Db, EvidenceRow, ExceptionRow, GrantRow, ReceiptRow, RevocationRow, StateRow, TransitionRow,
 };
+use crate::mcp::{self, McpConfig};
 use crate::model::{
     build_lineage, flatten_tree, grant_status, pretty_json, short_id, summarize_evidence,
     summarize_state, summarize_transition, GrantStatus, LineageNode, TreeRow,
 };
+use crate::snapshot::refresh_snapshot;
 use anyhow::Result;
+use serde_json::{json, Value};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -42,6 +45,255 @@ struct RowItem {
 }
 
 // ---------------------------------------------------------------------------
+// Write configuration + forms
+//
+// Writes never touch SQLite directly: the form collects arguments, one
+// MCP server is spawned for the submit, and it is killed before the
+// call returns (see crate::mcp). Afterwards the snapshot is refreshed
+// from the live DB and the TUI reloads from the snapshot.
+// ---------------------------------------------------------------------------
+
+/// How the console reaches the live kernel DB for writes.
+pub struct AppConfig {
+    /// Snapshot DB the TUI browses (read-only). Also `--db` / `EASTER_DB`.
+    pub db_path: String,
+    /// Live kernel DB for MCP writes. `None` disables the write keys.
+    pub live_db: Option<String>,
+    /// Path to `mcp_server.py`.
+    pub mcp_server_py: String,
+    /// Python interpreter for the MCP server.
+    pub python: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FormKind {
+    RecordEvidence,
+    RecordDecision,
+    ProposeTransition,
+}
+
+impl FormKind {
+    fn title(self) -> &'static str {
+        match self {
+            FormKind::RecordEvidence => "Record Evidence",
+            FormKind::RecordDecision => "Record Human Decision",
+            FormKind::ProposeTransition => "Propose Transition",
+        }
+    }
+}
+
+enum FieldKind {
+    /// Plain text; `required` rejects blank.
+    Text { required: bool },
+    /// Must parse as a JSON object when non-blank; `required` rejects
+    /// blank. Note: `{}` is valid -- blank means "absent", not "empty".
+    Json { required: bool },
+}
+
+struct FormField {
+    label: &'static str,
+    value: String,
+    kind: FieldKind,
+}
+
+struct WriteForm {
+    kind: FormKind,
+    fields: Vec<FormField>,
+    focus: usize,
+    error: Option<String>,
+}
+
+impl WriteForm {
+    fn new(kind: FormKind, identity: &str, grant: &str, from_state: Option<&str>) -> Self {
+        let id = FormField {
+            label: "requester_identity_id",
+            value: identity.to_string(),
+            kind: FieldKind::Text { required: true },
+        };
+        let gr = FormField {
+            label: "authority_grant_id",
+            value: grant.to_string(),
+            kind: FieldKind::Text { required: true },
+        };
+        let fields = match kind {
+            FormKind::RecordEvidence => vec![
+                id,
+                gr,
+                FormField {
+                    label: "payload (JSON object)",
+                    value: String::new(),
+                    kind: FieldKind::Json { required: true },
+                },
+            ],
+            FormKind::RecordDecision => vec![
+                id,
+                gr,
+                FormField {
+                    label: "subject",
+                    value: String::new(),
+                    kind: FieldKind::Text { required: true },
+                },
+                FormField {
+                    label: "decision",
+                    value: String::new(),
+                    kind: FieldKind::Text { required: true },
+                },
+                FormField {
+                    label: "rationale (optional)",
+                    value: String::new(),
+                    kind: FieldKind::Text { required: false },
+                },
+            ],
+            FormKind::ProposeTransition => vec![
+                id,
+                gr,
+                FormField {
+                    label: "from_state_id",
+                    value: from_state.unwrap_or("").to_string(),
+                    kind: FieldKind::Text { required: true },
+                },
+                FormField {
+                    label: "new_state_payload (JSON object)",
+                    value: String::new(),
+                    kind: FieldKind::Json { required: true },
+                },
+                FormField {
+                    label: "transition_payload (JSON object, optional)",
+                    value: String::new(),
+                    kind: FieldKind::Json { required: false },
+                },
+                FormField {
+                    label: "evidence_ids (comma-separated, optional)",
+                    value: String::new(),
+                    kind: FieldKind::Text { required: false },
+                },
+            ],
+        };
+        Self {
+            kind,
+            fields,
+            focus: 0,
+            error: None,
+        }
+    }
+
+    fn field(&self, label: &str) -> anyhow::Result<&FormField> {
+        self.fields
+            .iter()
+            .find(|f| f.label == label)
+            .ok_or_else(|| anyhow::anyhow!("unknown form field: {label}"))
+    }
+
+    fn text(&self, label: &str) -> &str {
+        self.field(label).map(|f| f.value.trim()).unwrap_or("")
+    }
+
+    /// Required text field: blank is an error.
+    fn req_text(&self, label: &str) -> anyhow::Result<&str> {
+        let f = self.field(label)?;
+        match f.kind {
+            FieldKind::Text { required: true } if f.value.trim().is_empty() => {
+                anyhow::bail!("{label} is required -- nothing was sent to MCP")
+            }
+            FieldKind::Text { .. } => Ok(f.value.trim()),
+            _ => anyhow::bail!("{label} is not a text field"),
+        }
+    }
+
+    /// Returns `None` for blank+optional, `Some(obj)` otherwise.
+    /// A present-but-empty `{}` is valid -- only *missing or malformed*
+    /// input is an error.
+    fn json_obj(&self, label: &str) -> anyhow::Result<Option<Value>> {
+        let f = self.field(label)?;
+        let required = match f.kind {
+            FieldKind::Json { required } => required,
+            _ => anyhow::bail!("{label} is not a JSON field"),
+        };
+        let raw = f.value.trim();
+        if raw.is_empty() {
+            if required {
+                anyhow::bail!("{label} is required -- nothing was sent to MCP");
+            }
+            return Ok(None);
+        }
+        let v: Value = serde_json::from_str(raw)
+            .map_err(|e| anyhow::anyhow!("{label} is not valid JSON: {e}"))?;
+        if !v.is_object() {
+            anyhow::bail!("{label} must be a JSON object");
+        }
+        Ok(Some(v))
+    }
+
+    /// Validate the form and build the `(tool_name, arguments)` pair.
+    /// Matches the Python console's `/evidence/record`,
+    /// `/evidence/decision`, and `/transition/propose` conventions.
+    fn validated_args(&self) -> anyhow::Result<(String, Value)> {
+        let requester = self.req_text("requester_identity_id")?;
+        let grant = self.req_text("authority_grant_id")?;
+        match self.kind {
+            FormKind::RecordEvidence => {
+                let payload = self.json_obj("payload (JSON object)")?.expect("required");
+                Ok((
+                    "record_evidence".to_string(),
+                    json!({
+                        "requester_identity_id": requester,
+                        "authority_grant_id": grant,
+                        "payload": payload,
+                    }),
+                ))
+            }
+            FormKind::RecordDecision => {
+                let subject = self.req_text("subject")?;
+                let decision = self.req_text("decision")?;
+                let mut payload = json!({
+                    "kind": "human_decision",
+                    "subject": subject,
+                    "decision": decision,
+                });
+                let rationale = self.text("rationale (optional)");
+                if !rationale.is_empty() {
+                    payload["rationale"] = json!(rationale);
+                }
+                Ok((
+                    "record_evidence".to_string(),
+                    json!({
+                        "requester_identity_id": requester,
+                        "authority_grant_id": grant,
+                        "payload": payload,
+                    }),
+                ))
+            }
+            FormKind::ProposeTransition => {
+                let from_state = self.req_text("from_state_id")?;
+                let new_state = self
+                    .json_obj("new_state_payload (JSON object)")?
+                    .expect("required");
+                let mut args = json!({
+                    "requester_identity_id": requester,
+                    "from_state_id": from_state,
+                    "authority_grant_id": grant,
+                    "new_state_payload": new_state,
+                });
+                if let Some(tp) = self.json_obj("transition_payload (JSON object, optional)")? {
+                    args["transition_payload"] = tp;
+                }
+                let ev: Vec<String> = self
+                    .text("evidence_ids (comma-separated, optional)")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !ev.is_empty() {
+                    args["evidence_ids"] = json!(ev);
+                }
+                Ok(("transition".to_string(), args))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -71,11 +323,23 @@ pub struct App {
     detail_scroll: u16,
     show_help: bool,
     status_msg: String,
+
+    // Write path: live DB for MCP writes (None disables the write
+    // keys), plus how to spawn the MCP server. Browsing always uses
+    // db_path, the read-only snapshot.
+    live_db: Option<String>,
+    mcp_server_py: String,
+    python: String,
+    write_form: Option<WriteForm>,
+    // In-session memory of the last-used identity/grant, prefilled into
+    // new forms. Never persisted; the operator still names them.
+    last_identity: String,
+    last_grant: String,
 }
 
 impl App {
-    pub fn load(db_path: &str) -> Result<Self> {
-        let db = Db::open_read_only(db_path)?;
+    pub fn load(cfg: &AppConfig) -> Result<Self> {
+        let db = Db::open_read_only(&cfg.db_path)?;
         let states = db.states()?;
         let transitions = db.transitions()?;
         let receipts = db.receipts()?;
@@ -132,7 +396,7 @@ impl App {
         let tree_rows = flatten_tree(&roots, &expanded);
 
         let mut app = Self {
-            db_path: db_path.to_string(),
+            db_path: cfg.db_path.clone(),
             states,
             states_by_id,
             transitions,
@@ -155,19 +419,174 @@ impl App {
             detail_scroll: 0,
             show_help: false,
             status_msg: String::new(),
+            live_db: cfg.live_db.clone(),
+            mcp_server_py: cfg.mcp_server_py.clone(),
+            python: cfg.python.clone(),
+            write_form: None,
+            last_identity: String::new(),
+            last_grant: String::new(),
         };
         app.list_state.select(Some(0));
         Ok(app)
     }
 
     pub fn reload(&mut self) {
-        self.status_msg = match Self::load(&self.db_path) {
+        let cfg = AppConfig {
+            db_path: self.db_path.clone(),
+            live_db: self.live_db.clone(),
+            mcp_server_py: self.mcp_server_py.clone(),
+            python: self.python.clone(),
+        };
+        // Preserve the operator's in-session identity/grant memory and
+        // any open form across reloads.
+        let (last_identity, last_grant, write_form) =
+            (self.last_identity.clone(), self.last_grant.clone(), self.write_form.take());
+        self.status_msg = match Self::load(&cfg) {
             Ok(fresh) => {
                 *self = fresh;
+                self.last_identity = last_identity;
+                self.last_grant = last_grant;
+                self.write_form = write_form;
                 "reloaded from disk".to_string()
             }
-            Err(e) => format!("reload failed: {e:#}"),
+            Err(e) => {
+                self.write_form = write_form;
+                format!("reload failed: {e:#}")
+            }
         };
+    }
+
+    // -- write forms --------------------------------------------------------
+
+    fn selected_state_id(&self) -> Option<String> {
+        match self.tab {
+            // Lineage tree rows and States rows are keyed by state_id.
+            0 | 1 => self.selected_id(),
+            _ => None,
+        }
+    }
+
+    fn open_write_form(&mut self, kind: FormKind) {
+        if self.live_db.is_none() {
+            self.status_msg =
+                "writes disabled: set EASTER_LIVE_DB (or --live-db) to enable".to_string();
+            return;
+        }
+        let from_state = if kind == FormKind::ProposeTransition {
+            self.selected_state_id()
+        } else {
+            None
+        };
+        self.write_form = Some(WriteForm::new(
+            kind,
+            &self.last_identity.clone(),
+            &self.last_grant.clone(),
+            from_state.as_deref(),
+        ));
+        self.status_msg.clear();
+    }
+
+    fn handle_form_key(&mut self, code: crossterm::event::KeyCode) -> bool {
+        use crossterm::event::KeyCode::*;
+        match code {
+            Esc => {
+                self.write_form = None;
+                self.status_msg = "write cancelled".to_string();
+            }
+            Enter => self.submit_write_form(),
+            _ => {
+                let form = match self.write_form.as_mut() {
+                    Some(f) => f,
+                    None => return true,
+                };
+                match code {
+                    Tab | Down => {
+                        form.focus = (form.focus + 1) % form.fields.len();
+                        form.error = None;
+                    }
+                    BackTab | Up => {
+                        form.focus = (form.focus + form.fields.len() - 1) % form.fields.len();
+                        form.error = None;
+                    }
+                    Backspace => {
+                        form.fields[form.focus].value.pop();
+                        form.error = None;
+                    }
+                    Char(c) => {
+                        form.fields[form.focus].value.push(c);
+                        form.error = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        true
+    }
+
+    fn submit_write_form(&mut self) {
+        let Some(form) = self.write_form.take() else {
+            return;
+        };
+        match self.run_submit(&form) {
+            Ok(msg) => {
+                // In-session memory only: prefill the next form, never
+                // persisted. The operator still names identity and grant.
+                self.last_identity = form.text("requester_identity_id").to_string();
+                self.last_grant = form.text("authority_grant_id").to_string();
+                self.status_msg = msg;
+            }
+            Err(e) => {
+                let mut form = form;
+                form.error = Some(format!("{e:#}"));
+                self.write_form = Some(form);
+            }
+        }
+    }
+
+    /// Validate, run one MCP call in a freshly spawned server (killed
+    /// before this returns), refresh the snapshot from the live DB, and
+    /// reload the TUI. The live DB is open only for this call.
+    fn run_submit(&mut self, form: &WriteForm) -> Result<String> {
+        let live_db = self
+            .live_db
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("writes disabled"))?;
+        let (tool, args) = form.validated_args()?;
+        let cfg = McpConfig::new(&self.python, &self.mcp_server_py, &live_db);
+        // The response is the commit confirmation: the kernel commits
+        // atomically before the tool returns.
+        let result = mcp::oneshot_call(&cfg, &tool, &args)?;
+
+        let mut note = String::new();
+        if let Err(e) = refresh_snapshot(&live_db, &self.db_path) {
+            note = format!(" -- snapshot refresh failed: {e:#}");
+        }
+        // Reload from the (refreshed) snapshot, keeping the in-session
+        // identity/grant memory.
+        let (li, lg) = (self.last_identity.clone(), self.last_grant.clone());
+        self.reload();
+        self.last_identity = li;
+        self.last_grant = lg;
+
+        let get = |k: &str| result.get(k).and_then(Value::as_str).unwrap_or("?");
+        let summary = match tool.as_str() {
+            "record_evidence" => format!(
+                "evidence {} recorded (receipt {}){}",
+                short_id(get("evidence_id")),
+                short_id(get("receipt_id")),
+                note
+            ),
+            "transition" => format!(
+                "transition {} -> state {} (receipt {}){}",
+                short_id(get("transition_id")),
+                short_id(get("state_id")),
+                short_id(get("receipt_id")),
+                note
+            ),
+            _ => format!("{tool} ok{note}"),
+        };
+        self.status_msg = summary.clone();
+        Ok(summary)
     }
 
     // -- rows ---------------------------------------------------------------
@@ -542,6 +961,9 @@ impl App {
             self.show_help = false;
             return true;
         }
+        if self.write_form.is_some() {
+            return self.handle_form_key(code);
+        }
         if self.searching {
             match code {
                 Esc | Enter => {
@@ -574,6 +996,9 @@ impl App {
                 self.searching = true;
             }
             Char('r') => self.reload(),
+            Char('e') => self.open_write_form(FormKind::RecordEvidence),
+            Char('d') => self.open_write_form(FormKind::RecordDecision),
+            Char('t') => self.open_write_form(FormKind::ProposeTransition),
             Tab => self.switch_tab((self.tab + 1) % TABS.len()),
             BackTab => self.switch_tab((self.tab + TABS.len() - 1) % TABS.len()),
             Char(c @ '1'..='6') => {
@@ -789,7 +1214,7 @@ impl App {
         } else if !self.status_msg.is_empty() {
             format!(" {}", self.status_msg)
         } else {
-            " j/k move · J/K scroll detail · Enter expand/jump · 1-6 tabs · / search · r reload · ? help · q quit "
+            " j/k move · J/K scroll detail · Enter expand/jump · 1-6 tabs · / search · e/d/t write · r reload · ? help · q quit "
                 .to_string()
         };
         f.render_widget(
@@ -803,6 +1228,63 @@ impl App {
         if self.show_help {
             self.render_help(f, area);
         }
+
+        if self.write_form.is_some() {
+            self.render_form(f, area);
+        }
+    }
+
+    fn render_form(&self, f: &mut Frame, area: Rect) {
+        let Some(form) = &self.write_form else {
+            return;
+        };
+        let label_w = form
+            .fields
+            .iter()
+            .map(|x| x.label.len())
+            .max()
+            .unwrap_or(0);
+        let mut lines = vec![
+            h1(form.kind.title()),
+            dim("one MCP server is spawned for the submit and killed right after"),
+            blank(),
+        ];
+        for (i, field) in form.fields.iter().enumerate() {
+            let cursor = if i == form.focus { "_" } else { "" };
+            let shown: String = field.value.chars().take(56).collect();
+            let style = if i == form.focus {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:>w$}  ", field.label, w = label_w),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(format!("{shown}{cursor}"), style),
+            ]));
+        }
+        if let Some(err) = &form.error {
+            lines.push(blank());
+            lines.push(Line::from(Span::styled(
+                err.clone(),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        lines.push(blank());
+        lines.push(dim("Tab / Up / Down move · type to edit · Enter submits · Esc cancels"));
+        let w = 78.min(area.width.saturating_sub(4));
+        let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+        let popup = centered_rect(w, h, area);
+        f.render_widget(Clear, popup);
+        f.render_widget(
+            Paragraph::new(Text::from(lines))
+                .block(Block::default().title(" Write ").borders(Borders::ALL)),
+            popup,
+        );
     }
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
@@ -817,11 +1299,16 @@ impl App {
             kv("Esc", "leave search · clear filter"),
             kv("g / G", "top / bottom of list"),
             kv("r", "reload the database from disk"),
+            kv("e", "record evidence (MCP write: server spawned per submit)"),
+            kv("d", "record a human decision (MCP write)"),
+            kv("t", "propose a transition (MCP write)"),
             kv("?", "this help"),
             kv("q", "quit"),
             blank(),
-            dim("Read-only: the console opens the kernel database"),
-            dim("SQLITE_OPEN_READ_ONLY and never writes."),
+            dim("Browsing reads a snapshot opened SQLITE_OPEN_READ_ONLY."),
+            dim("Writes go through the MCP server to the live DB: the"),
+            dim("server is spawned per submit and killed right after,"),
+            dim("then the snapshot is refreshed from the live DB."),
         ];
         let w = 72.min(area.width.saturating_sub(4));
         let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
@@ -928,11 +1415,46 @@ fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{fixture_db, mcp_server_py, test_python};
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn test_config(db: &str) -> AppConfig {
+        AppConfig {
+            db_path: db.to_string(),
+            live_db: None,
+            mcp_server_py: mcp_server_py(),
+            python: test_python(),
+        }
+    }
 
     fn test_app() -> App {
         let db = std::env::var("EASTER_TEST_DB").expect("set EASTER_TEST_DB to a kernel db");
-        App::load(&db).expect("load test db")
+        App::load(&test_config(&db)).expect("load test db")
+    }
+
+    /// App whose snapshot (`db_path`) and live DB are separate temp
+    /// copies, with writes enabled. Returns the tempdir guard (must be
+    /// kept alive) and the app.
+    fn test_app_with_writes() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let live = fixture_db(dir.path(), "identity:test-nathan");
+        let snap = dir.path().join("snap.db");
+        std::fs::copy(&live, &snap).unwrap();
+        let cfg = AppConfig {
+            db_path: snap.to_string_lossy().into_owned(),
+            live_db: Some(live.to_string_lossy().into_owned()),
+            mcp_server_py: mcp_server_py(),
+            python: test_python(),
+        };
+        let app = App::load(&cfg).expect("load test app");
+        (dir, app)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        use crossterm::event::KeyCode::*;
+        for c in text.chars() {
+            assert!(app.handle_key(Char(c)));
+        }
     }
 
     #[test]
@@ -988,5 +1510,99 @@ mod tests {
         assert_eq!(app.tab, 1);
         terminal.draw(|f| app.render(f)).unwrap();
         assert!(!app.handle_key(Char('q'))); // 'q' signals quit outside search
+    }
+
+    #[test]
+    fn write_form_records_evidence_and_refreshes_snapshot() {
+        use crossterm::event::KeyCode::*;
+        let (_dir, mut app) = test_app_with_writes();
+        let backend = TestBackend::new(140, 45);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Open the evidence form and render it (must not panic).
+        assert!(app.handle_key(Char('e')));
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // Fill identity, grant, payload; Tab moves between fields.
+        type_text(&mut app, "identity:test-nathan");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "grant:genesis-root");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "{\"note\":\"from rust form test\"}");
+        terminal.draw(|f| app.render(f)).unwrap();
+
+        // Submit: one MCP call, snapshot refresh, reload.
+        assert!(app.handle_key(Enter));
+        assert!(
+            app.status_msg.contains("recorded"),
+            "unexpected status: {}",
+            app.status_msg
+        );
+        // The reloaded snapshot shows the new evidence.
+        assert!(app
+            .evidence
+            .iter()
+            .any(|e| e.payload.contains("from rust form test")));
+
+        // In-session memory prefills the next form.
+        assert!(app.handle_key(Char('e')));
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(app.handle_key(Esc));
+    }
+
+    #[test]
+    fn write_form_rejects_bad_json_without_touching_mcp() {
+        use crossterm::event::KeyCode::*;
+        let (_dir, mut app) = test_app_with_writes();
+        let backend = TestBackend::new(140, 45);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        assert!(app.handle_key(Char('e')));
+        type_text(&mut app, "identity:test-nathan");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "grant:genesis-root");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "{not json");
+        assert!(app.handle_key(Enter));
+        // Form stays open with the validation error; nothing was sent.
+        assert!(app.write_form.is_some());
+        terminal.draw(|f| app.render(f)).unwrap();
+        assert!(app.handle_key(Esc));
+        assert!(app.write_form.is_none());
+    }
+
+    #[test]
+    fn write_form_accepts_empty_json_object() {
+        // Regression guard for the Python console's original `{}` bug:
+        // an empty object is valid input, not "missing".
+        use crossterm::event::KeyCode::*;
+        let (_dir, mut app) = test_app_with_writes();
+
+        // Grants tab: no from_state_id prefill (the States/Lineage tabs
+        // prefill it from the selection, which the operator can edit).
+        assert!(app.handle_key(Char('6')));
+        assert!(app.handle_key(Char('t'))); // propose transition
+        type_text(&mut app, "identity:test-nathan");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "grant:genesis-root");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "state:genesis");
+        assert!(app.handle_key(Tab));
+        type_text(&mut app, "{}"); // empty new_state_payload must be accepted
+        assert!(app.handle_key(Enter));
+        assert!(
+            app.status_msg.contains("transition"),
+            "unexpected status: {}",
+            app.status_msg
+        );
+    }
+
+    #[test]
+    fn write_keys_disabled_without_live_db() {
+        use crossterm::event::KeyCode::*;
+        let mut app = test_app(); // live_db: None
+        assert!(app.handle_key(Char('e')));
+        assert!(app.write_form.is_none());
+        assert!(app.status_msg.contains("writes disabled"));
     }
 }

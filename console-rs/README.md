@@ -1,10 +1,18 @@
 # easter-console
 
-A native terminal console for browsing an [EASTER](https://github.com/witsbi/easter)
-governed-state kernel. One static binary, no Python, no browser.
+A native terminal console for an [EASTER](https://github.com/witsbi/easter)
+governed-state kernel. One static binary for browsing, plus MCP-backed
+writes with enforced short write windows.
 
-**Read-only by construction.** The database is opened `SQLITE_OPEN_READ_ONLY`
-and the UI has no write path — it cannot mutate the kernel, only inspect it.
+**Reads are read-only by construction.** Browsing opens a *snapshot* of the
+kernel database with `SQLITE_OPEN_READ_ONLY` and never writes. **Writes go
+through the kernel only:** each submit (`e` record evidence, `d` record a
+human decision, `t` propose a transition) spawns one MCP server against the
+*live* database, performs a single `tools/call`, and kills the server before
+returning — the live DB is open only for the duration of one confirmed
+submit. The snapshot is then refreshed from the live DB and the TUI
+reloads. The console never writes SQLite itself and never duplicates kernel
+logic.
 
 ## Build
 
@@ -13,21 +21,32 @@ cargo build --release
 # binary: ./target/release/easter-console
 ```
 
-On a Mac this produces a native Apple-silicon (or Intel) binary with no
-runtime dependencies.
+On a Mac this produces a native Apple-silicon (or Intel) binary. The write
+path shells out to `python3 mcp_server.py` from the EASTER repo, so the Mac
+needs Python with the `mcp` package installed (same requirement as the
+Python console).
 
 ## Use
 
 ```bash
-# Interactive TUI (DB defaults to $EASTER_DB or ./data/kernel.db)
-easter-console --db ~/nginx/easter/data/kernel.db
+# Interactive TUI: browse a snapshot, writes disabled
+easter-console --db ~/snapshots/kernel.db
 
-# Scriptable text views (no terminal needed)
+# Interactive TUI with MCP writes enabled (live DB for the write window)
+EASTER_LIVE_DB=~/nginx/easter/data/kernel.db easter-console --db ~/snapshots/kernel.db
+# or: easter-console --db ~/snapshots/kernel.db --live-db ~/nginx/easter/data/kernel.db
+
+# Scriptable text views (no terminal needed; always read-only)
 easter-console --db kernel.db --dump lineage
 easter-console --db kernel.db --dump grants
 ```
 
 Views for `--dump`: `lineage | states | transitions | receipts | evidence | grants`.
+
+`EASTER_MCP_SERVER` and `EASTER_PYTHON` locate the MCP server subprocess
+(defaults: `mcp_server.py` next to the repo layout / current directory, and
+`python3`). When `EASTER_LIVE_DB` / `--live-db` is unset, the `e`/`d`/`t`
+write keys are disabled and the console is purely a browser.
 
 ## The TUI
 
@@ -52,6 +71,8 @@ attached to a transition, the exception behind a `FAILED` receipt.
 - `Enter` expand/collapse (Lineage) or jump to the related record
 - `1–6` / `Tab` switch tabs · `/` search the current tab · `Esc` clear
 - `g`/`G` top/bottom · `r` reload the DB from disk · `?` help · `q` quit
+- `e` record evidence · `d` record human decision · `t` propose transition
+  (MCP writes; disabled unless `--live-db` / `EASTER_LIVE_DB` is set)
 
 ## Notes
 
