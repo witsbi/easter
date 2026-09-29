@@ -11,7 +11,9 @@
 //! There is deliberately **no persistent-session API** in this module.
 //! The single entry point is [`oneshot_call`], which:
 //!
-//! 1. spawns the MCP server child,
+//! 1. spawns the MCP server child (the *calling thread* owns the
+//!    [`Child`] handle; a worker thread owns only the stdin/stdout
+//!    pipes),
 //! 2. performs the initialize handshake and exactly one `tools/call`,
 //! 3. kills and reaps the child before returning, on every path
 //!    (success, tool error, protocol error, timeout).
@@ -19,9 +21,14 @@
 //! The live kernel database is therefore only ever open for the
 //! duration of one confirmed submit -- seconds, not the TUI session
 //! lifetime. There is no handle to leak and no code path that keeps
-//! the child alive across submits. A hard timeout bounds even a
-//! hung server: on expiry the call fails and the worker thread reaps
-//! the child on its way out.
+//! the child alive across submits.
+//!
+//! The timeout is a true kill deadline: the calling thread -- the one
+//! that owns the [`Child`] -- performs the kill and the reaping wait
+//! itself on expiry, before the error is returned. An earlier design
+//! kept the child handle inside the worker thread, which meant a hung
+//! server was only reaped whenever the blocked worker happened to
+//! notice; that design is gone.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -29,7 +36,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Configuration for one-shot MCP write calls.
 #[derive(Clone, Debug)]
@@ -55,85 +62,93 @@ impl McpConfig {
     }
 }
 
-/// Kills and reaps the child on drop. Every exit path of the exchange
-/// goes through this guard, so the live-DB handle cannot outlive the
-/// call -- this is what enforces the short write window structurally.
-struct ChildGuard {
-    child: Option<Child>,
-}
+/// Perform exactly one MCP `tools/call` against a freshly spawned
+/// server, then tear the server down. See the module docs for the
+/// enforced short-window guarantee.
+///
+/// Ownership split is the whole trick: the worker thread gets the
+/// pipes, the calling thread keeps the [`Child`]. Whichever way the
+/// exchange ends, the calling thread -- not the worker -- is the one
+/// that kills and reaps.
+pub fn oneshot_call(cfg: &McpConfig, tool: &str, args: &Value) -> Result<Value> {
+    let mut child = spawn_mcp_server(cfg)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("mcp server stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("mcp server stdout unavailable"))?;
 
-impl ChildGuard {
-    fn new(child: Child) -> Self {
-        Self { child: Some(child) }
-    }
+    let tool = tool.to_string();
+    let args = args.clone();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(exchange(stdin, stdout, &tool, &args));
+    });
 
-    fn stdin(&mut self) -> Result<ChildStdin> {
-        self.child
-            .as_mut()
-            .and_then(|c| c.stdin.take())
-            .ok_or_else(|| anyhow!("mcp server stdin unavailable"))
-    }
-
-    fn stdout(&mut self) -> Result<ChildStdout> {
-        self.child
-            .as_mut()
-            .and_then(|c| c.stdout.take())
-            .ok_or_else(|| anyhow!("mcp server stdout unavailable"))
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            // Best effort: the exchange is over; the server must not
-            // survive it, whatever state it is in.
+    match rx.recv_timeout(cfg.timeout) {
+        Ok(result) => {
+            // Worker finished and dropped its pipe ends, so a
+            // well-behaved server exits on stdin EOF. Bounded grace
+            // for a slow exiter, then SIGKILL -- this path cannot hang.
+            reap_child(child, Duration::from_secs(5));
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // THE enforced deadline: the owner of the Child kills and
+            // reaps it here, before the error is returned. A hung
+            // server cannot survive this call.
             let _ = child.kill();
             let _ = child.wait();
+            Err(anyhow!(
+                "mcp write timed out after {}s; server child killed and reaped",
+                cfg.timeout.as_secs()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            reap_child(child, Duration::from_secs(5));
+            Err(anyhow!("mcp worker thread died before responding"))
         }
     }
 }
 
-/// Perform exactly one MCP `tools/call` against a freshly spawned
-/// server, then tear the server down. See the module docs for the
-/// enforced short-window guarantee.
-pub fn oneshot_call(cfg: &McpConfig, tool: &str, args: &Value) -> Result<Value> {
-    let cfg = cfg.clone();
-    let tool = tool.to_string();
-    let args = args.clone();
-    let timeout = cfg.timeout;
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = exchange(&cfg, &tool, &args);
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!(
-            "mcp write timed out after {}s; server reaped by worker",
-            timeout.as_secs()
-        )),
-    }
-}
-
-fn exchange(cfg: &McpConfig, tool: &str, args: &Value) -> Result<Value> {
+fn spawn_mcp_server(cfg: &McpConfig) -> Result<Child> {
     if !std::path::Path::new(&cfg.server_py).exists() {
         anyhow::bail!(
             "mcp server not found: {} (set EASTER_MCP_SERVER)",
             cfg.server_py
         );
     }
-    let mut guard = ChildGuard::new(
-        Command::new(&cfg.python)
-            .arg(&cfg.server_py)
-            .env("KERNEL_DB_PATH", &cfg.live_db)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("cannot spawn mcp server: {} {}", cfg.python, cfg.server_py))?,
-    );
-    let mut stdin = guard.stdin()?;
-    let mut reader = BufReader::new(guard.stdout()?);
+    Command::new(&cfg.python)
+        .arg(&cfg.server_py)
+        .env("KERNEL_DB_PATH", &cfg.live_db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("cannot spawn mcp server: {} {}", cfg.python, cfg.server_py))
+}
+
+/// Bounded reap: wait up to `grace` for natural exit, then SIGKILL and
+/// wait again. Always reaps; never hangs longer than `grace`.
+fn reap_child(mut child: Child, grace: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < grace {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => return,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn exchange(stdin: ChildStdin, stdout: ChildStdout, tool: &str, args: &Value) -> Result<Value> {
+    let mut stdin = stdin;
+    let mut reader = BufReader::new(stdout);
 
     let mut next_id: u64 = 1;
 
@@ -164,8 +179,8 @@ fn exchange(cfg: &McpConfig, tool: &str, args: &Value) -> Result<Value> {
         "tools/call",
         json!({"name": tool, "arguments": args}),
     )?;
-    // Dropping stdin lets a well-behaved server exit on EOF; the guard
-    // kills it regardless on the way out.
+    // Dropping stdin lets a well-behaved server exit on EOF; the
+    // caller reaps it regardless via reap_child.
     drop(stdin);
 
     let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
@@ -309,44 +324,81 @@ mod tests {
         assert!(msg.contains("does not exist") || msg.contains("rejected"), "unexpected: {msg}");
     }
 
+    /// Serializes tests that mutate the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `kill -0` succeeds while a pid exists *at all* -- including as a
+    /// zombie. So a failing `kill -0` proves the child was both killed
+    /// AND reaped (no lingering zombie holding the live DB open).
+    fn pid_is_gone(pid: u32) -> bool {
+        !SysCommand::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
     #[test]
-    fn oneshot_enforces_timeout() {
-        // Point at a "server" that never speaks MCP: the call must fail
-        // on the timeout, not hang, and the child must be reaped.
+    fn timeout_kills_and_reaps_child_before_returning() {
+        // The "server" writes its own pid to $SLEEPER_PIDFILE, then
+        // sleeps without ever speaking MCP. The timeout must not just
+        // stop waiting -- it must kill and reap the child before the
+        // error is returned. (This is the regression test for the
+        // review finding: the old design left the child handle inside
+        // the blocked worker thread, so expiry never killed anything.)
+        let _env = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let sleeper = dir.path().join("sleeper.py");
-        std::fs::write(&sleeper, "import time\ntime.sleep(30)\n").unwrap();
+        std::fs::write(
+            &sleeper,
+            "import os, time\n\
+             pidfile = os.environ.get('SLEEPER_PIDFILE')\n\
+             open(pidfile, 'w').write(str(os.getpid()))\n\
+             time.sleep(60)\n",
+        )
+        .unwrap();
+        let pidfile = dir.path().join("sleeper.pid");
+        std::env::set_var("SLEEPER_PIDFILE", &pidfile);
+
         let cfg = McpConfig {
             python: test_python(),
             server_py: sleeper.to_string_lossy().into_owned(),
             live_db: String::new(),
             timeout: Duration::from_secs(2),
         };
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let err = oneshot_call(&cfg, "record_evidence", &json!({})).expect_err("must time out");
-        assert!(start.elapsed() < Duration::from_secs(25), "took too long");
+        let elapsed = start.elapsed();
+        std::env::remove_var("SLEEPER_PIDFILE");
+
         assert!(format!("{err:#}").contains("timed out"), "unexpected: {err:#}");
+        assert!(elapsed < Duration::from_secs(25), "took too long: {elapsed:?}");
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("sleeper never wrote its pidfile")
+            .trim()
+            .parse()
+            .expect("pidfile was not a pid");
+        assert!(
+            pid_is_gone(pid),
+            "child {pid} still exists after timeout -- the kill deadline did not reap it"
+        );
     }
 
     #[test]
-    fn child_guard_kills_on_drop() {
+    fn reap_child_kills_stubborn_process() {
+        // reap_child must terminate even a process that ignores the
+        // grace period, and must not outlive the child as a zombie.
         let child = SysCommand::new("sleep")
             .arg("30")
             .spawn()
             .expect("cannot spawn sleep");
         let pid = child.id();
-        {
-            let _guard = ChildGuard::new(child);
-            // guard drops here -> kill + wait (reap)
-        }
-        // `kill -0` succeeds only while the pid exists (portable
-        // across Linux and macOS; the guard reaps, so no zombie).
-        let alive = SysCommand::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(!alive, "child {pid} survived ChildGuard drop");
+        reap_child(child, Duration::from_secs(1));
+        // try_wait on a moved child is unavailable; kill -0 failing
+        // proves the pid is fully gone (killed and reaped).
+        assert!(pid_is_gone(pid), "child {pid} survived reap_child");
     }
 }
