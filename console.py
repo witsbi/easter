@@ -165,7 +165,10 @@ pre {{ background: #f0f0f0; padding: 1rem; overflow-x: auto; white-space: pre-wr
   <a href="/identity">identity</a>
   <a href="/authority">authority</a>
   <a href="/evidence">evidence</a>
+  <a href="/evidence/record">record evidence</a>
+  <a href="/evidence/decision">record decision</a>
   <a href="/transition">transition</a>
+  <a href="/transition/propose">propose transition</a>
   <a href="/receipt">receipt</a>
   <a href="/exception">exception</a>
   <a href="/grant">grant</a>
@@ -212,6 +215,21 @@ def reject_cross_origin(request: Request) -> HTMLResponse | None:
     real browsers reliably attach Origin to state-changing
     cross-origin requests, so its complete absence is not the attack
     this check exists to stop.
+
+Participant writes: the Console also exposes the two non-root
+participant operations -- record_evidence and transition -- as
+explicit-argument forms, exactly the way it already exposes the
+root-only authority operations. This is what lets a human act as a
+first-party participant (their own requester_identity_id, their own
+grant) instead of having an agent document their actions second-hand.
+A "record decision" form is a thin ergonomic projection onto
+record_evidence: it assembles a conventional payload with
+kind="human_decision" and the Kernel sees only opaque JSON -- no
+normative "vote"/"approval" semantics were added below this module.
+Every participant write still names requester_identity_id and
+authority_grant_id explicitly; the Console never defaults them, and
+the Kernel's holder==requester check is the only thing that decides
+whether the operation is valid.
     """
     origin = request.headers.get("origin")
     referer = request.headers.get("referer")
@@ -457,7 +475,10 @@ directly.</p>
   <li><a href="/identity">Inspect a known Identity</a></li>
   <li><a href="/authority">Inspect a known Authority</a></li>
   <li><a href="/evidence">Inspect known Evidence</a></li>
+  <li><a href="/evidence/record">Record Evidence as yourself</a></li>
+  <li><a href="/evidence/decision">Record a human decision</a></li>
   <li><a href="/transition">Inspect a known Transition</a></li>
+  <li><a href="/transition/propose">Propose a Transition as yourself</a></li>
   <li><a href="/receipt">Inspect a known Receipt</a></li>
   <li><a href="/exception">Inspect Exception diagnostics by Receipt</a></li>
   <li><a href="/grant">Inspect a known Grant</a></li>
@@ -702,6 +723,228 @@ async def revoke_all_submit(request: Request) -> HTMLResponse:
     return page("Revoke All Grants -- result", REVOKE_ALL_FORM + result_block(is_error, result))
 
 
+# ------------------------------------------------------------------
+# Participant writes: record_evidence and transition for a human
+# acting as themselves.
+#
+# Same posture as the authority forms above: every form asks for
+# requester_identity_id and authority_grant_id explicitly -- the
+# Console never defaults them and never assumes "the operator is
+# root". Each submit is one MCP-0 tool call with exactly the
+# arguments MCP itself requires; the Console performs no Kernel
+# logic and no authority reasoning. Whether the presented grant is
+# valid, held by the requester, and sufficient is entirely the
+# Kernel's decision, enforced inside its own write transaction.
+#
+# The decision form is an ergonomic projection onto record_evidence
+# (see the module docstring): it builds a conventional payload, the
+# Kernel stores opaque JSON.
+# ------------------------------------------------------------------
+
+
+EVIDENCE_RECORD_FORM = """
+<form method="post" action="/evidence/record">
+  <fieldset>
+    <legend>Record Evidence (any currently valid grant held by the requester; need not be root)</legend>
+    <label>requester_identity_id <input type="text" name="requester_identity_id" required></label>
+    <label>authority_grant_id <input type="text" name="authority_grant_id" required></label>
+    <label>payload (JSON object) <input type="text" name="payload" placeholder='{"note": "..."}'></label>
+    <button type="submit">Record Evidence</button>
+  </fieldset>
+</form>
+<p class="warn">Evidence is immutable once admitted. The receipt names the
+requester above as the causing identity -- that first-party attribution is
+what this form exists to produce. Nothing is interpreted: the Kernel stores
+the payload opaquely.</p>
+"""
+
+DECISION_RECORD_FORM = """
+<form method="post" action="/evidence/decision">
+  <fieldset>
+    <legend>Record a human decision (stored as Evidence with a conventional payload)</legend>
+    <label>requester_identity_id <input type="text" name="requester_identity_id" required></label>
+    <label>authority_grant_id <input type="text" name="authority_grant_id" required></label>
+    <label>subject <input type="text" name="subject" required placeholder="what is being decided"></label>
+    <label>decision <input type="text" name="decision" required placeholder="the decision taken"></label>
+    <label>rationale <input type="text" name="rationale" placeholder="why (optional)"></label>
+    <button type="submit">Record Decision</button>
+  </fieldset>
+</form>
+<p class="warn">This is an ergonomic projection onto
+<code>record_evidence</code>: the Console assembles
+<code>{"kind": "human_decision", ...}</code> and the Kernel sees only opaque
+JSON. No "vote" or "approval" semantics exist below this page.</p>
+"""
+
+TRANSITION_PROPOSE_FORM = """
+<form method="post" action="/transition/propose">
+  <fieldset>
+    <legend>Propose a Transition (any currently valid grant held by the requester; need not be root)</legend>
+    <label>requester_identity_id <input type="text" name="requester_identity_id" required></label>
+    <label>from_state_id <input type="text" name="from_state_id" required></label>
+    <label>authority_grant_id <input type="text" name="authority_grant_id" required></label>
+    <label>new_state_payload (JSON object, required) <input type="text" name="new_state_payload" required placeholder='{"...": "..."}'></label>
+    <label>transition_payload (JSON object, optional) <input type="text" name="transition_payload" placeholder="{}"></label>
+    <label>evidence_ids (comma-separated, optional) <input type="text" name="evidence_ids" placeholder="evidence:..., evidence:..."></label>
+    <button type="submit">Propose Transition</button>
+  </fieldset>
+</form>
+<p class="warn">The Kernel performs no deduplication and chooses no preferred
+branch: proposing twice from the same state commits two valid branches. Which
+state to continue from is a userland decision, made fresh each time.</p>
+"""
+
+
+def _parse_json_object(raw: str | None, field_name: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse an optional JSON-object form field. Returns (value, error)."""
+    text = (raw or "").strip()
+    if not text:
+        return None, None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f"Invalid JSON in {field_name}: {exc}"
+    if not isinstance(value, dict):
+        return None, f"{field_name} must be a JSON object"
+    return value, None
+
+
+def _receipt_link(result: Any) -> str:
+    """Convenience link to the kernel-authored receipt, when one was returned."""
+    if isinstance(result, dict) and result.get("receipt_id"):
+        rid = html.escape(str(result["receipt_id"]))
+        return f'<p><a href="/receipt?receipt_id={rid}">Inspect receipt {rid}</a></p>'
+    return ""
+
+
+async def evidence_record_view(request: Request) -> HTMLResponse:
+    return page("Record Evidence", EVIDENCE_RECORD_FORM)
+
+
+async def evidence_record_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
+    form = await request.form()
+    payload, error = _parse_json_object(form.get("payload"), "payload")
+    if error:
+        return page(
+            "Record Evidence -- invalid input",
+            EVIDENCE_RECORD_FORM
+            + f'<p class="error">{html.escape(error)}. Nothing was sent to MCP.</p>',
+            status_code=400,
+        )
+
+    is_error, result = await mcp_client.call(
+        "record_evidence",
+        {
+            "requester_identity_id": form.get("requester_identity_id"),
+            "authority_grant_id": form.get("authority_grant_id"),
+            "payload": payload if payload is not None else {},
+        },
+    )
+    return page(
+        "Record Evidence -- result",
+        EVIDENCE_RECORD_FORM + result_block(is_error, result) + _receipt_link(result),
+    )
+
+
+async def decision_record_view(request: Request) -> HTMLResponse:
+    return page("Record Decision", DECISION_RECORD_FORM)
+
+
+async def decision_record_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
+    form = await request.form()
+    subject = (form.get("subject") or "").strip()
+    decision = (form.get("decision") or "").strip()
+    rationale = (form.get("rationale") or "").strip()
+    if not subject or not decision:
+        return page(
+            "Record Decision -- invalid input",
+            DECISION_RECORD_FORM
+            + '<p class="error">subject and decision are required. '
+            "Nothing was sent to MCP.</p>",
+            status_code=400,
+        )
+
+    payload: dict[str, Any] = {
+        "kind": "human_decision",
+        "subject": subject,
+        "decision": decision,
+    }
+    if rationale:
+        payload["rationale"] = rationale
+
+    is_error, result = await mcp_client.call(
+        "record_evidence",
+        {
+            "requester_identity_id": form.get("requester_identity_id"),
+            "authority_grant_id": form.get("authority_grant_id"),
+            "payload": payload,
+        },
+    )
+    return page(
+        "Record Decision -- result",
+        DECISION_RECORD_FORM + result_block(is_error, result) + _receipt_link(result),
+    )
+
+
+async def transition_propose_view(request: Request) -> HTMLResponse:
+    return page("Propose Transition", TRANSITION_PROPOSE_FORM)
+
+
+async def transition_propose_submit(request: Request) -> HTMLResponse:
+    rejection = reject_cross_origin(request)
+    if rejection is not None:
+        return rejection
+
+    form = await request.form()
+    new_state_payload, error = _parse_json_object(
+        form.get("new_state_payload"), "new_state_payload"
+    )
+    if error or not new_state_payload:
+        return page(
+            "Propose Transition -- invalid input",
+            TRANSITION_PROPOSE_FORM
+            + f'<p class="error">{html.escape(error or "new_state_payload is required")}. '
+            "Nothing was sent to MCP.</p>",
+            status_code=400,
+        )
+    transition_payload, error = _parse_json_object(
+        form.get("transition_payload"), "transition_payload"
+    )
+    if error:
+        return page(
+            "Propose Transition -- invalid input",
+            TRANSITION_PROPOSE_FORM
+            + f'<p class="error">{html.escape(error)}. Nothing was sent to MCP.</p>',
+            status_code=400,
+        )
+    evidence_raw = (form.get("evidence_ids") or "").strip()
+    evidence_ids = [e.strip() for e in evidence_raw.split(",") if e.strip()] or None
+
+    is_error, result = await mcp_client.call(
+        "transition",
+        {
+            "requester_identity_id": form.get("requester_identity_id"),
+            "from_state_id": form.get("from_state_id"),
+            "authority_grant_id": form.get("authority_grant_id"),
+            "new_state_payload": new_state_payload,
+            "transition_payload": transition_payload,
+            "evidence_ids": evidence_ids,
+        },
+    )
+    return page(
+        "Propose Transition -- result",
+        TRANSITION_PROPOSE_FORM + result_block(is_error, result) + _receipt_link(result),
+    )
+
+
 routes = [
     Route("/", home),
     Route("/state/genesis", get_genesis_state),
@@ -709,7 +952,13 @@ routes = [
     Route("/identity", get_identity),
     Route("/authority", get_authority),
     Route("/evidence", get_evidence),
+    Route("/evidence/record", evidence_record_view, methods=["GET"]),
+    Route("/evidence/record", evidence_record_submit, methods=["POST"]),
+    Route("/evidence/decision", decision_record_view, methods=["GET"]),
+    Route("/evidence/decision", decision_record_submit, methods=["POST"]),
     Route("/transition", get_transition),
+    Route("/transition/propose", transition_propose_view, methods=["GET"]),
+    Route("/transition/propose", transition_propose_submit, methods=["POST"]),
     Route("/receipt", get_receipt),
     Route("/exception", get_exception),
     Route("/grant", get_grant),
