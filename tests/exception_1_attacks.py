@@ -506,9 +506,10 @@ with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as
 
     print("EXC-6b (no ACCEPTED receipt ever carries an Exception) passed")
 
-    # 6c. record_failure() is a public method with no guard preventing
-    # a caller from supplying an operation_id that collides with an
-    # already-ACCEPTED operation's operation_id. Reproduce it.
+    # 6c. record_failure() must reject an operation_id that already has
+    # a terminal Receipt. The schema owns the race-free cardinality
+    # invariant; record_failure() translates that constraint failure
+    # into a deliberate KernelError instead of leaking raw SQLite text.
     accepted = kernel.transition(
         requester_identity_id=NATHAN,
         from_state_id=GENESIS,
@@ -523,12 +524,21 @@ with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as
             (real_operation_id,),
         ).fetchone()[0]
 
-    colliding_receipt_id = kernel.record_failure(
-        operation_id=real_operation_id,
-        outcome="FAILED",
-        reason="synthetic operation_id collision probe",
-        details={"note": "unrelated failure sharing operation_id with an ACCEPTED op"},
-    )
+    try:
+        kernel.record_failure(
+            operation_id=real_operation_id,
+            outcome="FAILED",
+            reason="synthetic operation_id collision probe",
+            details={"note": "unrelated failure sharing operation_id with an ACCEPTED op"},
+        )
+    except KernelError as exc:
+        assert str(exc) == (
+            "operation already has a terminal Receipt: "
+            f"{real_operation_id}"
+        )
+        assert "UNIQUE constraint failed" not in str(exc)
+    else:
+        raise AssertionError("duplicate operation_id must be rejected")
 
     with kernel.connect() as conn:
         rows_for_operation = conn.execute(
@@ -537,17 +547,11 @@ with tempfile.NamedTemporaryFile(prefix="exception-1-attacks-", suffix=".db") as
             (real_operation_id,),
         ).fetchall()
 
-    outcomes_for_operation = [r[1] for r in rows_for_operation]
-    print(
-        f"EXC-6c FINDING: operation_id {real_operation_id!r} now has "
-        f"{len(rows_for_operation)} receipts with outcomes {outcomes_for_operation} "
-        f"-- record_failure() has no check preventing a caller from attaching "
-        f"an unrelated FAILED/REJECTED Exception to an operation_id that "
-        f"already has a committed ACCEPTED receipt."
-    )
     assert accepted_receipt_count_before == 1
-    assert len(rows_for_operation) == 2
-    assert set(outcomes_for_operation) == {"ACCEPTED", "FAILED"}
+    assert len(rows_for_operation) == 1
+    assert rows_for_operation[0][1] == "ACCEPTED"
+
+    print("EXC-6c (one operation_id / one terminal Receipt enforced) passed")
 
     print("EXC-6 (Receipt<->Exception integrity) complete")
 
