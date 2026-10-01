@@ -316,6 +316,10 @@ CREATE TABLE receipt_evidence (
 --
 -- operation_id lets the receipt refer to the attempted operation
 -- without pretending that attempt became authoritative state.
+-- One operation_id identifies one attempted kernel operation and may
+-- have at most one terminal Receipt. idx_receipts_operation_unique is UNIQUE
+-- so this cardinality is transactional database law, not a race-prone
+-- application pre-check.
 --
 -- payload has CHECK(json_valid(...)) for the same reason states.
 -- payload does: a kernel representation invariant, not userland
@@ -405,7 +409,7 @@ CREATE INDEX idx_transitions_from_state
 CREATE INDEX idx_transitions_authority_grant
     ON transitions(authority_grant_id);
 
-CREATE INDEX idx_receipts_operation
+CREATE UNIQUE INDEX idx_receipts_operation_unique
     ON receipts(operation_id);
 
 

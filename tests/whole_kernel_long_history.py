@@ -483,19 +483,15 @@ with kernel.connect() as conn:
             "an ACCEPTED Authority-operation receipt should never look like it owns State lineage"
         )
 
-    # 13: operation_id de-facto uniqueness across everything produced
-    # by the 6 real entry points in this entire history (record_failure
-    # direct calls used explicit distinct operation_id strings above,
-    # excluded here since those are deliberately testing collision
-    # elsewhere, not this history).
+    # 13: operation_id uniqueness is schema-enforced across every Receipt,
+    # including direct first-use record_failure() calls.
     dup_operation_ids = conn.execute(
         """
         SELECT operation_id, COUNT(*) c FROM receipts
-        WHERE operation_id NOT LIKE 'operation:area-%' AND operation_id != 'operation:genesis'
         GROUP BY operation_id HAVING c > 1
         """
     ).fetchall()
-    assert dup_operation_ids == [], f"real entry points must never naturally collide on operation_id: {dup_operation_ids}"
+    assert dup_operation_ids == [], f"one operation_id must identify at most one Receipt: {dup_operation_ids}"
 
     # 9: receipt_seq is monotonic and never reused; used ONLY as PK
     # auto-increment, never read by any kernel decision (already
@@ -528,7 +524,7 @@ with kernel.connect() as conn:
 assert [tuple(r) for r in integrity] == [("ok",)], integrity
 assert list(fk_check) == []
 
-note("GRAPH-AUDIT", f"whole-history audit clean across {total_receipts} receipts / {total_transitions} transitions / {total_states} states: operation_id de-facto unique per real entry-point invocation, receipt_seq monotonic/never reused, UNIQUE(to_state_id) held, every REJECTED/FAILED receipt has exactly one Exception, PRAGMA integrity_check ok, zero FK violations -- NON-VIOLATION")
+note("GRAPH-AUDIT", f"whole-history audit clean across {total_receipts} receipts / {total_transitions} transitions / {total_states} states: operation_id unique by schema, receipt_seq monotonic/never reused, UNIQUE(to_state_id) held, every REJECTED/FAILED receipt has exactly one Exception, PRAGMA integrity_check ok, zero FK violations -- NON-VIOLATION")
 
 print()
 print(f"Long adversarial history complete: {total_receipts} receipts, {total_transitions} transitions, {total_states} states.")
