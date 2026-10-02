@@ -11,13 +11,14 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-EXPECTED_PASS_COUNT = 31
+EXPECTED_PASS_COUNT = 32
 TEST_TIMEOUT_SECONDS = 180
 
 # Each script receives a newly initialized database. "authority" additionally
 # creates the stable identity/Authority prerequisites those two focused tests
 # require; no generated identifier is shared between scripts.
 SUPPORTED_TESTS = (
+    ("tests/harness_0_1_pythonoptimize.py", "base"),
     ("tests/initialize_test.py", "base"),
     ("tests/authority_2_ordering_and_scope.py", "authority"),
     ("tests/authority_3_root_model.py", "authority"),
@@ -75,10 +76,13 @@ kernel.define_authority(
 
 
 def run_checked(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.pop("PYTHONOPTIMIZE", None)
+    environment["PYTHONPATH"] = str(REPO)
     return subprocess.run(
         command,
         cwd=REPO,
-        env={**os.environ, "PYTHONPATH": str(REPO)},
+        env=environment,
         text=True,
         capture_output=capture,
         timeout=TEST_TIMEOUT_SECONDS,
@@ -99,6 +103,14 @@ def reset_fixture(profile: str) -> None:
 
 
 def main() -> int:
+    if sys.flags.optimize:
+        print(
+            "HARNESS ERROR: optimized Python disables assertion-based checks; "
+            "rerun without -O/-OO or PYTHONOPTIMIZE",
+            file=sys.stderr,
+        )
+        return 2
+
     if len(SUPPORTED_TESTS) != EXPECTED_PASS_COUNT:
         print(
             "HARNESS ERROR: declared expected count "

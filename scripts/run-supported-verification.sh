@@ -6,6 +6,10 @@ PYTHON_BIN=${PYTHON_BIN:-python3}
 SCRATCH_ROOT=${TMPDIR:-/tmp}
 WORKSPACE=$(mktemp -d "$SCRATCH_ROOT/easter-supported-verification.XXXXXX")
 
+# The suite's historical scripts use Python assertions as checks. Never let a
+# caller's ambient optimization setting silently strip them.
+unset PYTHONOPTIMIZE
+
 cleanup() {
     rm -rf "$WORKSPACE"
 }
