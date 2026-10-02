@@ -15,7 +15,7 @@ The command creates a temporary exported copy of the current Git `HEAD`, creates
 Success is exactly:
 
 ```text
-RESULT: PASS (31/31 scripts)
+RESULT: PASS (32/32 scripts)
 ```
 
 Any dependency, fixture, timeout, or assertion failure exits nonzero and identifies the failing script. The configured count is checked by the harness itself, so adding or removing a supported script requires deliberately updating the expected count.
@@ -35,8 +35,9 @@ The remediation was exercised with CPython 3.14.7, Python's SQLite 3.53.4 bindin
 
 ## Current suite boundary
 
-The 31-script supported suite covers:
+The 32-script supported suite covers:
 
+- harness enforcement that assertion-based tests cannot run under optimized Python;
 - fresh initialization and refusal to overwrite;
 - Authority ordering, scope, and root-model checks using generated isolated prerequisites;
 - Receipt minimality and one-operation/one-terminal-Receipt cardinality, including the PR #31 regression;

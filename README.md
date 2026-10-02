@@ -363,7 +363,7 @@ builds a fresh isolated database for every current verification script, and
 returns nonzero on the first failure. The expected successful result is:
 
 ```text
-RESULT: PASS (31/31 scripts)
+RESULT: PASS (32/32 scripts)
 ```
 
 See [`docs/verification.md`](docs/verification.md) for the supported Python and
