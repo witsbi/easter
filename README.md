@@ -350,6 +350,27 @@ Kernel powers come from kernel structures and operations, not JSON claims.
 **Authority is independent of State.**<br>
 Returning to an old State does not restore an Authority or Grant that has since been revoked.
 
+## Verification
+
+A clean clone has one supported verification command:
+
+```bash
+PYTHON_BIN=python3.14 ./scripts/run-supported-verification.sh
+```
+
+It creates an exported temporary workspace, installs the pinned MCP dependency,
+builds a fresh isolated database for every current verification script, and
+returns nonzero on the first failure. The expected successful result is:
+
+```text
+RESULT: PASS (31/31 scripts)
+```
+
+See [`docs/verification.md`](docs/verification.md) for the supported Python and
+SQLite environment, exact current-suite boundary, and the historical,
+retired, dogfood, and deployment-integration scripts intentionally preserved
+outside this command.
+
 ## Status
 
 EASTER currently consists of:
