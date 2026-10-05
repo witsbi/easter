@@ -44,10 +44,17 @@ class IssuanceReader:
             conn.close()
 
     def resolve_public_key(self, key_id: str) -> Ed25519PublicKey | None:
+        """None for an unknown key id *or* a revoked one -- the caller
+        (``tokens.verify``) cannot tell the two apart, by design: a
+        revoked key must fail exactly like an unregistered one, not
+        surface a distinguishable error an attacker could use to probe
+        key status. A retired key still resolves (rotation overlap is
+        intentional); only 'revoked' is excluded."""
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT pubkey FROM keys WHERE id = ?", (key_id,)
+                    "SELECT pubkey FROM keys WHERE id = ? AND status != 'revoked'",
+                    (key_id,),
                 ).fetchone()
         except sqlite3.Error as exc:
             raise IssuanceReadError("issuance key lookup failed") from exc

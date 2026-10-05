@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS keys (
     pubkey      TEXT NOT NULL,
     privkey_ref TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    status      TEXT NOT NULL CHECK (status IN ('active', 'retired'))
+    status      TEXT NOT NULL CHECK (status IN ('active', 'retired', 'revoked'))
 );
 
 CREATE TABLE IF NOT EXISTS tokens (
@@ -73,6 +73,32 @@ CREATE TABLE IF NOT EXISTS audit_log (
     actor  TEXT NOT NULL,
     jti    TEXT,
     detail TEXT NOT NULL DEFAULT '{}'
+);
+
+-- Tracks one consequential operation (mint/revoke/rotate/revoke_key)
+-- from the moment its natural key is claimed through kernel Evidence
+-- confirmation to the moment its broker-local durable effect lands.
+-- op_key's PRIMARY KEY is the concurrency-control point: two requests
+-- for the same logical effect (e.g. two concurrent revokes of the
+-- same jti) can never both hold a 'claimed' row for the same op_key,
+-- so at most one of them ever reaches the kernel Evidence call.
+-- Rows are deleted on normal completion (op_key is a scratch
+-- coordination key, not permanent history -- the kernel Evidence
+-- record and the tokens/keys row are the durable history) or on a
+-- failed Evidence write (release_claim). A row that outlives its
+-- operation (status != 'claimed') marks a genuine Evidence/broker-state
+-- disagreement for /reconcile to resolve.
+CREATE TABLE IF NOT EXISTS operations (
+    op_key      TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK (kind IN ('mint', 'revoke', 'rotate', 'revoke_key')),
+    status      TEXT NOT NULL CHECK (
+        status IN ('claimed', 'evidence_confirmed', 'key_committed', 'needs_manual_reconciliation')
+    ),
+    evidence_id TEXT,
+    receipt_id  TEXT,
+    detail      TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
 );
 """
 
@@ -233,11 +259,43 @@ class Issuance:
         return self.commit_new_key(private_key, key_id, pubkey_b64, actor=actor)
 
     def retire_key(self, key_id: str, *, actor: str) -> None:
+        """RETIRED: may no longer sign, but existing signatures keep
+        verifying -- this is deliberate rotation overlap (spec section
+        8), not a security response. Distinct from ``revoke_key``."""
         with self._connect() as conn:
             conn.execute(
-                "UPDATE keys SET status = 'retired' WHERE id = ?", (key_id,)
+                "UPDATE keys SET status = 'retired' WHERE id = ? AND status != 'revoked'",
+                (key_id,),
             )
         self._audit(actor=actor, action="KEY_RETIRE", jti=None, detail={"key_id": key_id})
+
+    def revoke_key(self, key_id: str, *, actor: str) -> None:
+        """REVOKED: may not sign or verify. Every token signed by this
+        key fails verification immediately, including ones this
+        issuance.db cannot individually enumerate or denylist by jti --
+        enforced in ``reader.IssuanceReader.resolve_public_key``, which
+        refuses to resolve a revoked key's public key at all, so
+        verification fails closed before a signature is even checked.
+        Unlike ``retire_key``, this is one-way and not part of ordinary
+        rotation: it is the response to a suspected or known key
+        exposure. Idempotent: revoking an already-revoked key is a
+        harmless no-op (checked by the caller via ``get_key`` before
+        deciding whether a new accountability record is needed)."""
+        with self._connect() as conn:
+            conn.execute("UPDATE keys SET status = 'revoked' WHERE id = ?", (key_id,))
+        self._audit(actor=actor, action="KEY_REVOKE", jti=None, detail={"key_id": key_id})
+
+    def get_key(self, key_id: str) -> dict[str, Any] | None:
+        """Pure read. Lets a caller check a key's current lifecycle
+        status before deciding whether an accountability record for a
+        revocation needs to be written at all -- mirrors ``get_token``/
+        ``mark_revoked``'s split for tokens."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, alg, pubkey, created_at, status FROM keys WHERE id = ?",
+                (key_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def active_key(self) -> dict[str, Any] | None:
         """The current signing key. Rotation may leave more than one
@@ -300,21 +358,31 @@ class Issuance:
         label: str | None,
         actor: str,
     ) -> None:
+        """Idempotent on ``jti`` (``INSERT OR IGNORE``): a jti is
+        128-bit random, so a second call with the same jti is never an
+        ordinary duplicate request -- it is /reconcile replaying a mint
+        whose kernel Evidence already succeeded but whose own write
+        previously failed (see Finding 2 in the PR #35 review). Only
+        audits when a row was actually newly inserted, so a replay that
+        finds the row already present does not add a second misleading
+        audit entry for one durable effect."""
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
-                INSERT INTO tokens
+                INSERT OR IGNORE INTO tokens
                     (jti, identity, grants_json, key_id, issued_at, expires_at, label)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (jti, identity, grants_json, key_id, issued_at, expires_at, label),
             )
-        self._audit(
-            actor=actor,
-            action="TOKEN_MINT",
-            jti=jti,
-            detail={"identity": identity, "grants": json.loads(grants_json)},
-        )
+            inserted = cur.rowcount == 1
+        if inserted:
+            self._audit(
+                actor=actor,
+                action="TOKEN_MINT",
+                jti=jti,
+                detail={"identity": identity, "grants": json.loads(grants_json)},
+            )
 
     def get_token(self, jti: str) -> dict[str, Any] | None:
         """Pure read. Lets a caller check existence/already-revoked
@@ -335,13 +403,19 @@ class Issuance:
         UPDATE (idempotent WHERE clause below), never a corruption.
         Call this only after the accountability record for the
         revocation has already succeeded, so a revocation is never
-        recorded durably with no matching kernel Evidence."""
+        recorded durably with no matching kernel Evidence. Only audits
+        when the conditional UPDATE actually changed a row: a call
+        that loses the idempotent-WHERE race (or replays a reconciled
+        revoke) must not add a second audit entry claiming a second
+        state change that did not happen."""
         with self._connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL",
                 (utc_now(), jti),
             )
-        self._audit(actor=actor, action="TOKEN_REVOKE", jti=jti, detail={})
+            changed = cur.rowcount == 1
+        if changed:
+            self._audit(actor=actor, action="TOKEN_REVOKE", jti=jti, detail={})
 
     def revoke_token(self, jti: str, *, actor: str) -> bool:
         """Convenience: check-and-revoke in one call, with no
@@ -402,5 +476,120 @@ class Issuance:
                 "SELECT seq, ts, action, actor, jti, detail FROM audit_log "
                 "ORDER BY seq DESC LIMIT ?",
                 (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Operation claims: concurrency control (one op_key, one winner) and
+    # a durable trace of "kernel Evidence confirmed this" that survives
+    # a crash before the broker-local effect lands, so that disagreement
+    # is reconcilable rather than silently lost (PR #35 review Findings
+    # 2-4). See broker/app.py's handlers and the ``/reconcile`` route.
+    # ------------------------------------------------------------------
+
+    def claim_operation(self, op_key: str, kind: str, detail: dict[str, Any]) -> bool:
+        """Atomically claim ``op_key`` for this request. Returns False
+        if another request already holds (or finished and left
+        unresolved) a claim for the same op_key -- the caller must not
+        proceed to call the kernel a second time for the same logical
+        effect. The INSERT's PRIMARY KEY conflict is enforced by SQLite
+        itself, not by anything in this process, so it holds even
+        across two truly concurrent requests."""
+        now = utc_now()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO operations (op_key, kind, status, detail, created_at, updated_at) "
+                    "VALUES (?, ?, 'claimed', ?, ?, ?)",
+                    (op_key, kind, json.dumps(detail), now, now),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def release_claim(self, op_key: str) -> None:
+        """The kernel Evidence write failed: nothing durable happened,
+        so the claim is deleted outright (not just marked) -- a later
+        legitimate retry (e.g. with a corrected grant) must not be
+        blocked by a stale row. Only deletes while still 'claimed':
+        once evidence has been confirmed, the row is load-bearing
+        reconciliation state and must never be silently discarded."""
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM operations WHERE op_key = ? AND status = 'claimed'",
+                (op_key,),
+            )
+
+    def mark_evidence_confirmed(self, op_key: str, *, evidence_id: str | None, receipt_id: str | None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE operations SET status = 'evidence_confirmed', evidence_id = ?, "
+                "receipt_id = ?, updated_at = ? WHERE op_key = ? AND status = 'claimed'",
+                (evidence_id, receipt_id, utc_now(), op_key),
+            )
+
+    def mark_key_committed(self, op_key: str) -> None:
+        """Rotation only: the new key is durably persisted; only
+        retiring the old key remains. Narrows what a crash here leaves
+        to reconcile -- retiring a key needs no secret material, so
+        this status is always auto-reconcilable (see /reconcile)."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE operations SET status = 'key_committed', updated_at = ? "
+                "WHERE op_key = ? AND status = 'evidence_confirmed'",
+                (utc_now(), op_key),
+            )
+
+    def mark_needs_manual_reconciliation(self, op_key: str) -> None:
+        """Rotation only, and only for the sub-case /reconcile cannot
+        safely auto-heal: kernel Evidence for a new key already cites
+        that key's id/pubkey, but persisting it failed, and the
+        in-memory private key material from that crashed/failed
+        request is gone. Minting a replacement here would describe a
+        key the cited Evidence never named -- fabricated history. This
+        status exists so that disagreement is surfaced, not hidden."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE operations SET status = 'needs_manual_reconciliation', updated_at = ? "
+                "WHERE op_key = ?",
+                (utc_now(), op_key),
+            )
+
+    def complete_operation(self, op_key: str) -> None:
+        """The broker-local durable effect now agrees with the kernel
+        Evidence that was recorded for it -- the scratch coordination
+        row is no longer needed."""
+        with self._connect() as conn:
+            conn.execute("DELETE FROM operations WHERE op_key = ?", (op_key,))
+
+    def get_operation(self, op_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM operations WHERE op_key = ?", (op_key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_unresolved_operations(self) -> list[dict[str, Any]]:
+        """Rows left behind by a crash or failure after a claim was
+        made. Deliberately excludes plain 'claimed' rows: a 'claimed'
+        row with no evidence_id yet might just be a request still
+        in flight, not stuck, and guessing wrong would either block a
+        live request's reconciliation or (worse) let /reconcile race
+        a live request. Those are surfaced separately, unresolved, as a
+        known gap -- see the broker/app.py ``/reconcile`` docstring."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM operations WHERE status != 'claimed' ORDER BY created_at"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_stale_claims(self) -> list[dict[str, Any]]:
+        """Rows still in 'claimed' status -- might be in-flight
+        requests, might be crashed ones. Returned for operator
+        visibility only; /reconcile never acts on these automatically
+        (see list_unresolved_operations)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM operations WHERE status = 'claimed' ORDER BY created_at"
             ).fetchall()
         return [dict(r) for r in rows]
