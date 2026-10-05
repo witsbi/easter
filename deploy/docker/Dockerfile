@@ -5,7 +5,10 @@
 #
 # The gateway spawns mcp_server.py as a subprocess via sys.executable,
 # so the image carries the full runtime: kernel.py, mcp_server.py,
-# gateway.py, initialize.py, and schema.sql.
+# gateway.py, initialize.py, schema.sql, and broker/ (gateway.py has
+# unconditional module-level imports of broker.tokens/broker.reader
+# for its Ed25519 token-verification path -- that import is not
+# optional even when the path itself is disabled via --issuance-db).
 FROM python:3.12-slim
 
 RUN apt-get update \
@@ -25,6 +28,7 @@ COPY deploy/docker/requirements-gateway.txt ./deploy/docker/requirements-gateway
 RUN pip install --no-cache-dir -r deploy/docker/requirements-gateway.txt
 
 COPY kernel.py mcp_server.py gateway.py initialize.py schema.sql ./
+COPY broker ./broker
 COPY deploy/docker/entrypoint.sh /usr/local/bin/easter-entrypoint
 RUN chmod +x /usr/local/bin/easter-entrypoint \
     && mkdir -p /data && chown -R easter:easter /app /data
