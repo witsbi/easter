@@ -78,6 +78,14 @@ kernel.define_authority(
 def run_checked(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment.pop("PYTHONOPTIMIZE", None)
+    # Loopback test traffic must never be intercepted by an ambient
+    # HTTP(S) proxy. "*" is urllib's own documented bypass-all value
+    # (see urllib.request.proxy_bypass_environment) -- a host-list
+    # bypass such as "127.0.0.1,localhost" is not enough, because
+    # api_0_6_loopback_launch_contract.py deliberately probes the
+    # machine's non-loopback address too.
+    environment["NO_PROXY"] = "*"
+    environment["no_proxy"] = "*"
     environment["PYTHONPATH"] = str(REPO)
     return subprocess.run(
         command,
