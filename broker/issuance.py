@@ -163,24 +163,48 @@ class Issuance:
     # Key lifecycle
     # ------------------------------------------------------------------
 
-    def generate_key(self, *, actor: str) -> dict[str, Any]:
-        """Generate a fresh Ed25519 issuance keypair, store the private
-        half, and record the public half. Does not retire any existing
-        key -- rotation with overlap is the caller's job (see
-        ``rotate_key`` semantics in the token-broker spec section 8:
-        the old public key stays registered until every token it
-        signed has expired)."""
+    def prepare_new_key(self) -> tuple[Ed25519PrivateKey, str, str]:
+        """Generate a fresh Ed25519 keypair **in memory only** -- no
+        keychain write, no database row, no audit entry. Returns
+        (private_key, key_id, pubkey_b64).
+
+        Split from persistence (``commit_new_key``) so a caller can
+        record the accountability evidence for a rotation *before*
+        anything durable exists to be orphaned if that evidence write
+        fails. Discarding the return value here has zero side effects
+        to clean up.
+        """
         private_key = Ed25519PrivateKey.generate()
         public_key = private_key.public_key()
         key_id = new_key_id()
-
-        private_bytes = private_key.private_bytes(
-            Encoding.Raw, PrivateFormat.Raw, NoEncryption()
-        )
         pubkey_b64 = base64.b64encode(
             public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
         ).decode("ascii")
+        return private_key, key_id, pubkey_b64
 
+    def commit_new_key(
+        self,
+        private_key: Ed25519PrivateKey,
+        key_id: str,
+        pubkey_b64: str,
+        *,
+        actor: str,
+    ) -> dict[str, Any]:
+        """Persist a keypair already produced by ``prepare_new_key``.
+
+        Callers must not call this until the accountability record for
+        the rotation (the kernel Evidence citing ``key_id``/``pubkey_b64``)
+        has already succeeded -- that ordering is what prevents an
+        orphaned key with no kernel-side record. This method performs
+        the only durable writes: the keychain/file store and the
+        ``keys`` row. Does not retire any existing key -- rotation with
+        overlap is the caller's job (see the token-broker spec section
+        8: the old public key stays registered until every token it
+        signed has expired).
+        """
+        private_bytes = private_key.private_bytes(
+            Encoding.Raw, PrivateFormat.Raw, NoEncryption()
+        )
         privkey_ref = self._store_private_key(key_id, private_bytes)
         created_at = utc_now()
 
@@ -194,6 +218,19 @@ class Issuance:
             )
         self._audit(actor=actor, action="KEY_GENERATE", jti=None, detail={"key_id": key_id})
         return {"key_id": key_id, "pubkey": pubkey_b64, "created_at": created_at}
+
+    def generate_key(self, *, actor: str) -> dict[str, Any]:
+        """Convenience: prepare and commit a new key in one call, with
+        no accountability-ordering gate in between.
+
+        Safe for test fixtures and any other caller that is not also
+        recording kernel Evidence for the rotation. The broker's own
+        ``/rotate-key`` HTTP handler does NOT use this method -- it
+        calls ``prepare_new_key``/``commit_new_key`` separately so the
+        Evidence write can gate persistence (see ``broker/app.py``).
+        """
+        private_key, key_id, pubkey_b64 = self.prepare_new_key()
+        return self.commit_new_key(private_key, key_id, pubkey_b64, actor=actor)
 
     def retire_key(self, key_id: str, *, actor: str) -> None:
         with self._connect() as conn:
@@ -279,21 +316,45 @@ class Issuance:
             detail={"identity": identity, "grants": json.loads(grants_json)},
         )
 
-    def revoke_token(self, jti: str, *, actor: str) -> bool:
-        """Denylist a token by jti. Returns False if the jti is
-        unknown (caller decides whether that's an error)."""
+    def get_token(self, jti: str) -> dict[str, Any] | None:
+        """Pure read. Lets a caller check existence/already-revoked
+        state *before* deciding whether an accountability record (the
+        kernel Evidence for a revocation) needs to be written at all --
+        see ``mark_revoked`` for the paired write."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT revoked_at FROM tokens WHERE jti = ?", (jti,)
+                "SELECT * FROM tokens WHERE jti = ?", (jti,)
             ).fetchone()
-            if row is None:
-                return False
-            if row["revoked_at"] is None:
-                conn.execute(
-                    "UPDATE tokens SET revoked_at = ? WHERE jti = ?",
-                    (utc_now(), jti),
-                )
+        return dict(row) if row else None
+
+    def mark_revoked(self, jti: str, *, actor: str) -> None:
+        """Denylist a token already confirmed (via ``get_token``) to
+        exist and not yet be revoked. Does not re-check either
+        condition -- callers that skip the check accept whatever a
+        concurrent revoke already did, which is at most a redundant
+        UPDATE (idempotent WHERE clause below), never a corruption.
+        Call this only after the accountability record for the
+        revocation has already succeeded, so a revocation is never
+        recorded durably with no matching kernel Evidence."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE tokens SET revoked_at = ? WHERE jti = ? AND revoked_at IS NULL",
+                (utc_now(), jti),
+            )
         self._audit(actor=actor, action="TOKEN_REVOKE", jti=jti, detail={})
+
+    def revoke_token(self, jti: str, *, actor: str) -> bool:
+        """Convenience: check-and-revoke in one call, with no
+        accountability-ordering gate in between. Safe for test
+        fixtures and any caller not also recording kernel Evidence.
+        The broker's own ``/revoke-token`` HTTP handler does NOT use
+        this method -- see ``broker/app.py``. Returns False if the jti
+        is unknown (caller decides whether that's an error)."""
+        row = self.get_token(jti)
+        if row is None:
+            return False
+        if row["revoked_at"] is None:
+            self.mark_revoked(jti, actor=actor)
         return True
 
     def is_revoked(self, jti: str) -> bool:

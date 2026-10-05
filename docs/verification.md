@@ -15,7 +15,7 @@ The command creates a temporary exported copy of the current Git `HEAD`, creates
 Success is exactly:
 
 ```text
-RESULT: PASS (34/34 scripts)
+RESULT: PASS (35/35 scripts)
 ```
 
 Any dependency, fixture, timeout, or assertion failure exits nonzero and identifies the failing script. The configured count is checked by the harness itself, so adding or removing a supported script requires deliberately updating the expected count.
@@ -36,7 +36,7 @@ The remediation was exercised with CPython 3.14.7, Python's SQLite 3.53.4 bindin
 
 ## Current suite boundary
 
-The 34-script supported suite covers:
+The 35-script supported suite covers:
 
 - harness enforcement that assertion-based tests cannot run under optimized Python;
 - fresh initialization and refusal to overwrite;
@@ -48,6 +48,7 @@ The 34-script supported suite covers:
 - Console inspection, Authority operations, confirmation, CSRF, malformed-input, observability, and human-participant checks;
 - focused v0.2 observability behavior;
 - EASTER Enterprise token broker: Ed25519 mint/rotate/revoke, key-rotation overlap, signature/claim/expiry/TTL-cap rejection, private-key-never-logged, and EASTER Evidence lineage for every broker action, verified against the real kernel's own records, not the broker's self-report;
+- EASTER Enterprise token broker, Evidence-ordering safety and input hardening (added 2026-10-05 after independent review of PR #35): mint, revoke-token, and rotate-key each force a real kernel Evidence-write rejection (a nonexistent `authority_grant_id`, not a mock) and assert directly against the broker's own `issuance.db` that no row was created and no existing row was mutated -- the durable broker-side effect and the canonical kernel accountability record can never diverge, because the broker-side write never happens until the kernel write has already succeeded; revoke-token is additionally idempotent, returning `already_revoked: true` with no second Evidence write when a token is revoked twice; the v1 token role is pinned to `"agent"` and any other value is rejected with a 400, not silently coerced or ignored; `ttl_seconds` is validated end to end (non-integer, non-positive, and the 24h policy-cap boundary and over-cap cases) with a clean 400 rather than an unhandled exception;
 - gateway dual token path: the pre-existing opaque `SessionStore` path is unchanged and continues to work; a parallel Ed25519 path (unknown/revoked/expired/tampered/malformed/bad-role rejection, rotation overlap, the issuance-outage failure mode, and the authority trip-wire) is admitted alongside it via a read-only `broker/reader.py` view of the broker's `issuance.db`, preserving the gateway's structural no-kernel-sqlite/no-kernel-import boundary (the trip-wire for a signed token is process-local, not the broker's own persistent denylist -- see `gateway.py`'s module docstring for that known gap).
 
 Every script receives a newly initialized database. The two current Authority scripts also receive an isolated `identity:clawde` and `authority:clawde-scope-alpha` fixture created through supported kernel operations. No generated identifier is copied from another test or a developer ledger.
