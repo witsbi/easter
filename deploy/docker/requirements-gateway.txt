@@ -1,9 +1,9 @@
 # EASTER gateway container dependencies (GATEWAY-0).
 #
-# Everything gateway.py imports directly: mcp, starlette, uvicorn.
-# The mcp pin lives in requirements-mcp.txt (shared with the stdio
-# path); starlette and uvicorn are pinned here because only the
-# containerized gateway needs the web stack, and the stdio install
+# Everything gateway.py imports directly: mcp, starlette, uvicorn,
+# cryptography. The mcp pin lives in requirements-mcp.txt (shared with
+# the stdio path); starlette and uvicorn are pinned here because only
+# the containerized gateway needs the web stack, and the stdio install
 # stays lean without it.
 #
 # mcp==2.2.0 declares starlette>=0.27 and uvicorn>=0.31.1 with no upper
@@ -11,6 +11,12 @@
 # so the image build is reproducible instead of floating on mcp's open
 # range. Re-resolve (fresh pip install, record the versions) before
 # bumping mcp.
+#
+# cryptography added 2026-10-05 for Ed25519 verification of the
+# EASTER Enterprise token broker's signed tokens (broker/tokens.py,
+# broker/reader.py). The gateway never mints or stores private key
+# material -- this dependency is verification-only.
 -r ../../requirements-mcp.txt
 starlette==1.7.0
 uvicorn==0.34.0
+cryptography==50.0.2

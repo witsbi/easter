@@ -54,6 +54,27 @@ What this skeleton does:
     transport for tenant isolation.
   - Invalid, expired, or killed tokens are rejected (401/403) before
     MCP is ever called.
+  - Dual token path (EASTER Enterprise migration overlap). A bearer
+    token is tried first against the opaque ``SessionStore`` (unchanged
+    behavior above); if that lookup misses AND an issuance database is
+    configured (``--issuance-db`` / ``ISSUANCE_DB_PATH``), the token is
+    tried as an Ed25519-signed compact token (``broker/tokens.py``),
+    verified against the broker's registered public key for the
+    token's ``kid``, and checked against the broker's own token
+    denylist (read-only: this module never writes to ``issuance.db``,
+    only the broker daemon does). A verified Ed25519 token is
+    projected into the exact same session-shaped dict the opaque path
+    already produces (``identity_id``/``grant_ids``/``role``/``label``/
+    ``expires_at``), so every downstream invariant below -- binding,
+    grant-liveness, the authority trip-wire, admin-tool blocking --
+    applies identically to both token kinds. This lets both verify
+    during the broker migration's overlap window, per the token-broker
+    spec section 12. Known gap: the trip-wire for an Ed25519 token adds
+    its ``jti`` to an in-process set, not the broker's own persistent
+    denylist (this gateway has no write path into ``issuance.db``), so
+    that kill does not survive a gateway restart the way an opaque
+    session's revocation (a file) does. Tracked as follow-up, not
+    silently assumed solved.
 
 What it deliberately does NOT do yet (follow-up PRs):
   - Rate limiting / per-identity quotas.
@@ -99,6 +120,9 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+
+from broker import tokens as broker_tokens
+from broker.reader import IssuanceReader, IssuanceReadError
 
 HERE = Path(__file__).parent
 MCP_SERVER_PATH = HERE / "mcp_server.py"
@@ -501,7 +525,57 @@ def _bind_arguments(
     return bound
 
 
-def make_app(store: SessionStore, backend: MCPBackend) -> Starlette:
+def make_app(
+    store: SessionStore,
+    backend: MCPBackend,
+    issuance: IssuanceReader | None = None,
+) -> Starlette:
+    # Process-local only -- see the module docstring's "known gap" note
+    # on why this does not survive a gateway restart the way the
+    # opaque path's SessionStore.revoke() (a file) does.
+    tripwired_jtis: set[str] = set()
+
+    def _lookup_session(token: str) -> tuple[dict[str, Any] | None, str, str | None]:
+        """Try the opaque path first, then the Ed25519 path if an
+        issuance reader is configured. Returns (session_dict_or_None,
+        token_kind, jti_or_None) -- token_kind/jti let the caller kill
+        the right credential later without re-parsing the token."""
+        session = store.lookup(token)
+        if session is not None:
+            return session, "opaque", None
+
+        if issuance is None or token.count(".") != 2:
+            return None, "opaque", None
+
+        try:
+            claims = broker_tokens.verify(
+                token, resolve_public_key=issuance.resolve_public_key
+            )
+        except (broker_tokens.TokenError, IssuanceReadError):
+            return None, "ed25519", None
+
+        try:
+            if claims.jti in tripwired_jtis or issuance.is_denylisted(claims.jti):
+                return None, "ed25519", claims.jti
+        except IssuanceReadError:
+            return None, "ed25519", claims.jti
+
+        projected = {
+            "identity_id": claims.sub,
+            "grant_ids": list(claims.grants),
+            "role": claims.role,
+            "label": claims.lbl or "",
+            "created_at": claims.iat,
+            "expires_at": claims.exp,
+        }
+        return projected, "ed25519", claims.jti
+
+    def _kill(token: str, kind: str, jti: str | None) -> None:
+        if kind == "opaque":
+            store.revoke(token)
+        elif jti is not None:
+            tripwired_jtis.add(jti)
+
     async def health(request: Request) -> JSONResponse:
         return JSONResponse({"ok": True, "service": "easter-gateway-0"})
 
@@ -522,7 +596,7 @@ def make_app(store: SessionStore, backend: MCPBackend) -> Starlette:
         token = _bearer_token(request)
         if token is None:
             return JSONResponse({"error": "missing bearer token"}, status_code=401)
-        session = store.lookup(token)
+        session, token_kind, token_jti = _lookup_session(token)
         if session is None:
             # Invalid, expired, or trip-wire-killed: identical response,
             # and the kernel never sees the request (no receipt-spam
@@ -572,7 +646,7 @@ def make_app(store: SessionStore, backend: MCPBackend) -> Starlette:
                 # The grant is gone or outside its window. Kill the
                 # session so it cannot keep knocking, and stop here:
                 # the kernel never sees this write.
-                store.revoke(token)
+                _kill(token, token_kind, token_jti)
                 return JSONResponse(
                     {"error": "authority grant is not live; session revoked"},
                     status_code=403,
@@ -586,7 +660,7 @@ def make_app(store: SessionStore, backend: MCPBackend) -> Starlette:
                 # (revoked -- the one case the pre-check cannot see).
                 # Kill the session; at most this one rejected write
                 # reaches the kernel per grant-death event.
-                store.revoke(token)
+                _kill(token, token_kind, token_jti)
                 return JSONResponse(
                     {"error": "authority rejected; session revoked"},
                     status_code=403,
@@ -631,6 +705,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--key", required=True, help="TLS private key file (PEM)")
     p_serve.add_argument("--sessions", default=str(DEFAULT_SESSIONS_PATH))
     p_serve.add_argument("--kernel-db", default=os.environ.get("KERNEL_DB_PATH"))
+    p_serve.add_argument(
+        "--issuance-db",
+        default=os.environ.get("ISSUANCE_DB_PATH"),
+        help="broker's issuance.db, read-only, to enable the Ed25519 "
+             "token path alongside the opaque one (omit to disable it)",
+    )
 
     p_mint = sub.add_parser("mint", help="mint an agent token (local ceremony)")
     p_mint.add_argument("--identity", required=True)
@@ -662,7 +742,8 @@ def _cli() -> None:
             sys.exit(2)
         store = SessionStore(args.sessions)
         backend = MCPBackend(args.kernel_db)
-        app = make_app(store, backend)
+        issuance = IssuanceReader(args.issuance_db) if args.issuance_db else None
+        app = make_app(store, backend, issuance)
         uvicorn.run(
             app,
             host=args.host,

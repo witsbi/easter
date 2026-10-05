@@ -40,7 +40,8 @@ git -C "$ROOT" archive HEAD | tar -x -C "$WORKSPACE/repo"
 "$PYTHON_BIN" -m venv "$WORKSPACE/venv"
 "$WORKSPACE/venv/bin/python" -m pip install \
     --disable-pip-version-check \
-    -r "$WORKSPACE/repo/requirements-mcp.txt"
+    -r "$WORKSPACE/repo/requirements-mcp.txt" \
+    -r "$WORKSPACE/repo/requirements-verification.txt"
 
 "$WORKSPACE/venv/bin/python" \
     "$WORKSPACE/repo/scripts/run_supported_suite.py"

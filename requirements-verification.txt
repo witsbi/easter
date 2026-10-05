@@ -1,0 +1,18 @@
+# Additional dependencies needed only to RUN the supported verification
+# suite (scripts/run_supported_suite.py), not to deploy the stdio MCP
+# path (requirements-mcp.txt) or the containerized gateway/broker
+# (deploy/docker/requirements-*.txt, which pin these explicitly for
+# reproducible image builds).
+#
+# starlette/uvicorn are not listed here: mcp==2.2.0 already declares
+# them as dependencies with no upper bound, so they resolve
+# transitively from requirements-mcp.txt alone, as they already did
+# for the console/API tests before this file existed.
+#
+# cryptography and keyring have no such transitive path -- added
+# 2026-10-05 for tests/broker_1_mint_rotate_revoke.py and
+# tests/gateway_1_enterprise_tokens.py (Ed25519 token mint/verify and
+# OS-keychain-backed issuance-key storage). Versions match the pins in
+# deploy/docker/requirements-broker.txt; re-resolve both together.
+cryptography==50.0.2
+keyring==25.7.0

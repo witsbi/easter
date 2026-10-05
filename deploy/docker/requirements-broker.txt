@@ -1,0 +1,17 @@
+# EASTER Enterprise token broker container dependencies.
+#
+# Everything broker/*.py imports directly: mcp (for kernel_client.py's
+# Evidence-recording calls), starlette/uvicorn (the admin API), the
+# same versions already pinned for the gateway so the two images stay
+# consistent; cryptography for Ed25519 mint/verify; keyring for OS
+# keychain storage of the issuance private key (file-with-chmod-600 is
+# the in-process fallback when no keychain backend is available, not a
+# separate dependency).
+#
+# Versions below are what pip resolved on 2026-10-05, pinned for
+# reproducible builds. Re-resolve before bumping.
+-r ../../requirements-mcp.txt
+starlette==1.7.0
+uvicorn==0.34.0
+cryptography==50.0.2
+keyring==25.7.0

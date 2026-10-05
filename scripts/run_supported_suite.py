@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-EXPECTED_PASS_COUNT = 32
+EXPECTED_PASS_COUNT = 34
 TEST_TIMEOUT_SECONDS = 180
 
 # Each script receives a newly initialized database. "authority" additionally
@@ -50,6 +50,8 @@ SUPPORTED_TESTS = (
     ("tests/console_0_7_v0_2_observability.py", "base"),
     ("tests/console_0_8_human_participant_records.py", "base"),
     ("tests/v0_2_observability_1_focused.py", "base"),
+    ("tests/broker_1_mint_rotate_revoke.py", "base"),
+    ("tests/gateway_1_enterprise_tokens.py", "base"),
 )
 
 AUTHORITY_FIXTURE = """\
