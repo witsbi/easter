@@ -57,6 +57,7 @@ The repository deliberately preserves scripts that are not in the current suppor
 - `dogfood_0_*.py` is an ordered historical dogfood ceremony, not an isolated regression suite.
 - `v0_2_observability_2_adversarial.py` contains development-ledger corpus-size assumptions; its current, fixture-independent counterpart is included.
 - `gateway_0_1_skeleton.py` exercises deployment/session/TLS integration assumptions outside the clean-clone kernel/MCP/API/Console artifact boundary.
+- `gateway_2_enterprise_hook_lazy_import.py` proves `gateway.py`'s Ed25519 token-verification extension point (gated on `--issuance-db`) imports and runs with zero dependency on the separate, paid EASTER Enterprise broker package, and fails with a clear named error (not a bare `ModuleNotFoundError`) if `--issuance-db` is passed without that package installed. Deployment-integration territory like `gateway_0_1_skeleton.py`, not an artifact-boundary script with isolated per-run fixtures.
 - `tests/kernel.py` is an import guard/helper, not an executable verification script.
 
 These files are not deleted, rewritten, or represented as failures. They remain inspectable historical or integration evidence and may still be run with their documented prerequisites.
