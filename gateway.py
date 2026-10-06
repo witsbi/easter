@@ -544,7 +544,16 @@ def make_app(
         try:
             from broker import tokens as broker_tokens
             from broker.reader import IssuanceReader, IssuanceReadError
-        except ImportError as exc:
+        except ModuleNotFoundError as exc:
+            # Only convert the specific "broker itself is missing" case
+            # to the friendly message. If broker/ is installed but one
+            # of ITS dependencies (e.g. cryptography) is missing, that
+            # is a different problem with a different remedy -- telling
+            # the operator to install the Enterprise package would be
+            # wrong, and raising SystemExit here would also swallow the
+            # chained traceback that actually points at the real cause.
+            if exc.name != "broker" and not str(exc.name or "").startswith("broker."):
+                raise
             raise SystemExit(
                 "--issuance-db was given, but the EASTER Enterprise broker "
                 "package ('broker', providing broker.tokens/broker.reader) "
